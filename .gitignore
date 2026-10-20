@@ -1,0 +1,6 @@
+/target/
+/deploy/
+*.db
+*.db-shm
+*.db-wal
+cargo.lock

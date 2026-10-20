@@ -1,0 +1,18 @@
+[package]
+name = "appdir-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless background core: ETW capture into the SQLite ledger."
+
+[[bin]]
+name = "appdir-core"
+path = "src/main.rs"
+
+[dependencies]
+appdir-core = { path = "../core" }
+appdir-capture = { path = "../capture" }
+
+[dependencies.windows]
+version = "0.58"
+features = ["Win32_System_Console", "Win32_Foundation", "Win32_UI_WindowsAndMessaging"]

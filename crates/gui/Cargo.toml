@@ -1,0 +1,14 @@
+[package]
+name = "appdir-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "On-demand GUI: monitor roots, ledger settings, query & safe clean."
+
+[[bin]]
+name = "appdir-gui"
+path = "src/main.rs"
+
+[dependencies]
+appdir-core = { path = "../core" }
+eframe = { version = "0.28", default-features = false, features = ["glow", "default_fonts"] }

@@ -1,0 +1,14 @@
+[package]
+name = "appdir-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "appdir command line front end."
+
+[[bin]]
+name = "appdir"
+path = "src/main.rs"
+
+[dependencies]
+appdir-core = { path = "../core" }
+appdir-capture = { path = "../capture" }
