@@ -15,4 +15,4 @@ appdir-capture = { path = "../capture" }
 
 [dependencies.windows]
 version = "0.58"
-features = ["Win32_System_Console", "Win32_Foundation", "Win32_UI_WindowsAndMessaging"]
+features = ["Win32_System_Console", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading"]

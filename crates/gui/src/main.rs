@@ -1,21 +1,24 @@
 //! appdir-gui.exe - 按需打开的图形界面 (egui/eframe, 纯 Rust)。
-#![windows_subsystem = "windows"]
 //!
 //! 职责:
 //!   1. 管理监视目录列表 (账本 monitor_roots 表)
 //!   2. 设置账本存放路径 (写 exe 同目录的 appdir.json, 与 appdir-core.exe 共享)
-//!   3. 账本总览: 列出每个 EXE 及其创建的目录数; 选中后勾选删除 (备份+两步删除)
+//!   3. 账本总览: 可按 EXE 或按监视根两种视图分类; 选中后勾选删除 (备份+两步删除)
 //!
 //! 仅调用 appdir-core 现有 API (Db / clean), 不重复实现业务逻辑。
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use appdir_core::{
-    clean, config, path, timefmt, AppRow, CleanOptions, Candidate, Db, MonitorRoot, RecordStatus,
+    clean, config, path, regcheck, timefmt, AppRow, CleanOptions, Candidate, Db, MonitorRoot,
+    RecordStatus, RegAppSummary, RegRow,
 };
 use eframe::egui;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+mod symlink_tab;
+mod unlocker;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -32,6 +35,17 @@ enum Tab {
     Roots,
     Settings,
     Ledger,
+    RegLedger,
+    Symlink,
+}
+
+/// 账本总览的两种分类方式。
+#[derive(PartialEq, Clone, Copy)]
+enum LedgerView {
+    /// 按创建目录的程序 (exe) 聚合。
+    ByApp,
+    /// 按监视根聚合, 组内列出该根下捕获到的目录。
+    ByRoot,
 }
 
 struct DirRowUi {
@@ -47,11 +61,18 @@ struct AppSummary {
     pub dir_count: usize,
 }
 
+#[derive(Clone)]
+struct RootSummary {
+    pub root: String,
+    pub dir_count: usize,
+    pub exe_count: usize,
+}
+
 struct App {
     tab: Tab,
     config_path: PathBuf,
     config: appdir_core::config::AppConfig,
-    db: Option<Db>,
+    db: Option<std::sync::Arc<Db>>,
     status: String,
 
     // roots tab
@@ -60,12 +81,21 @@ struct App {
 
     // settings tab
     ledger_edit: String,
+    startup_checked: bool,
 
     // ledger tab
     apps: Vec<AppSummary>,
+    root_groups: Vec<RootSummary>,
+    ledger_view: LedgerView,
     selected: Option<i64>,
+    selected_root: Option<String>,
+    // registry ledger tab
+    reg_apps: Vec<RegAppSummary>,
+    reg_selected: Option<i64>,
+    reg_rows: Vec<RegRow>,
     results: Vec<DirRowUi>,
     last_refresh: std::time::Instant,
+    symlink: symlink_tab::SymlinkState,
 }
 
 impl App {
@@ -83,28 +113,41 @@ impl App {
                     version: config::CONFIG_VERSION,
                     ledger_path: config::default_ledger_path(&config_path),
                     backup: true,
+                    registry_monitor: false,
+                    reg_mode: "off".into(),
+                    reg_prefixes: Vec::new(),
                 },
                 None,
                 format!("配置加载失败: {e}"),
             ),
         };
+        let db = db.map(std::sync::Arc::new);
         let ledger_edit = config.ledger_path.display().to_string();
         let mut app = Self {
             tab: Tab::Ledger,
             config_path,
             config,
-            db,
+            db: db.clone(),
             status,
             new_root: String::new(),
             roots: Vec::new(),
             ledger_edit,
+            startup_checked: startup::is_installed(),
             apps: Vec::new(),
+            root_groups: Vec::new(),
+            ledger_view: LedgerView::ByApp,
             selected: None,
+            selected_root: None,
             results: Vec::new(),
+            reg_apps: Vec::new(),
+            reg_selected: None,
+            reg_rows: Vec::new(),
             last_refresh: std::time::Instant::now(),
+            symlink: symlink_tab::SymlinkState::new(db.clone()),
         };
         app.reload_roots();
         app.reload_apps();
+        app.reload_reg_apps();
         app
     }
 
@@ -120,18 +163,30 @@ impl App {
 
     fn reload_apps(&mut self) {
         self.apps.clear();
+        self.root_groups.clear();
         self.selected = None;
+        self.selected_root = None;
         self.results.clear();
         let Some(db) = &self.db else { return };
-        // 按 app 聚合目录记录; 已删除 (Missing) 的不算进计数,
+        // 按 app / 按监视根 同时聚合目录记录; 已删除 (Missing) 的不算进计数,
         // 与明细页一致: 总览数字 = 当前仍存在的目录数。
         let mut by_app: BTreeMap<i64, Vec<appdir_core::DirRow>> = BTreeMap::new();
+        // key = 小写路径 (Windows 大小写不敏感), value = (显示路径, 目录数, 程序集合)。
+        let mut by_root: BTreeMap<String, (String, usize, std::collections::BTreeSet<i64>)> =
+            BTreeMap::new();
         match db.all_dirs() {
             Ok(dirs) => {
                 for d in dirs {
                     if d.record_status == RecordStatus::Missing {
                         continue;
                     }
+                    let entry = by_root
+                        .entry(d.monitor_root.to_ascii_lowercase())
+                        .or_insert_with(|| {
+                            (d.monitor_root.clone(), 0, std::collections::BTreeSet::new())
+                        });
+                    entry.1 += 1;
+                    entry.2.insert(d.app_id);
                     by_app.entry(d.app_id).or_default().push(d);
                 }
             }
@@ -154,10 +209,29 @@ impl App {
             });
         }
         self.apps.sort_by(|a, b| b.dir_count.cmp(&a.dir_count));
+        // 监视根分组: 以配置中的根为准 (0 条也显示), 再补上账本里残留的旧根。
+        for r in &self.roots {
+            let (root, dir_count, apps) = by_root
+                .remove(&r.path.to_ascii_lowercase())
+                .unwrap_or_else(|| (r.path.clone(), 0, std::collections::BTreeSet::new()));
+            self.root_groups.push(RootSummary {
+                root,
+                dir_count,
+                exe_count: apps.len(),
+            });
+        }
+        for (_, (root, dir_count, apps)) in by_root {
+            self.root_groups.push(RootSummary {
+                root,
+                dir_count,
+                exe_count: apps.len(),
+            });
+        }
     }
 
     fn open_app(&mut self, app_id: i64, preserve_checks: bool) {
         self.selected = Some(app_id);
+        self.selected_root = None;
         // 总是重建列表 (否则自动刷新会追加重复行); 勾选状态按 directory_id 保留。
         let old_checks: std::collections::HashMap<i64, bool> = self
             .results
@@ -212,8 +286,79 @@ impl App {
         }
     }
 
+    /// 按监视根打开明细: 该根下捕获到的全部目录, 每行标注创建它的 exe。
+    fn open_root(&mut self, root: &str, preserve_checks: bool) {
+        self.selected = None;
+        self.selected_root = Some(root.to_string());
+        // 总是重建列表; 勾选状态按 directory_id 保留。
+        let old_checks: std::collections::HashMap<i64, bool> = self
+            .results
+            .iter()
+            .map(|r| (r.candidate.directory_id, r.checked))
+            .collect();
+        self.results.clear();
+        let Some(db) = &self.db else { return };
+        let dirs: Vec<appdir_core::DirRow> = match db.all_dirs() {
+            Ok(ds) => ds
+                .into_iter()
+                .filter(|d| d.monitor_root.eq_ignore_ascii_case(root))
+                .collect(),
+            Err(e) => {
+                self.status = format!("读取账本失败: {e}");
+                return;
+            }
+        };
+        let protected: Vec<String> = vec![
+            self.config.ledger_path.display().to_string(),
+            self.config_path.display().to_string(),
+        ];
+        // app_id -> exe_path 缓存, 避免同一程序重复查 SQLite。
+        let mut exe_cache: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+        for d in dirs {
+            let exe_path = match exe_cache.get(&d.app_id) {
+                Some(p) => p.clone(),
+                None => {
+                    let p = db
+                        .app_by_id(d.app_id)
+                        .ok()
+                        .flatten()
+                        .map(|a| a.exe_path)
+                        .unwrap_or_default();
+                    exe_cache.insert(d.app_id, p.clone());
+                    p
+                }
+            };
+            let mut cand = Candidate {
+                directory_path: d.directory_path.clone(),
+                monitor_root: d.monitor_root,
+                directory_id: d.directory_id,
+                app_exe_path: exe_path.clone(),
+                created_at_ms: d.created_at_ms,
+                record_status: d.record_status,
+                identity: None,
+                blocked: None,
+            };
+            if let Ok(v) = clean::verify(db, &d.directory_path, Some(&exe_path), &protected) {
+                cand = v;
+            }
+            // 已删除的目录不再展示（账本状态 Missing，或 verify 确认目录不存在）。
+            let gone = cand.record_status == RecordStatus::Missing
+                || matches!(cand.blocked, Some((clean::BlockReason::Missing, _)));
+            if gone {
+                continue;
+            }
+            let checked = if preserve_checks {
+                old_checks.get(&cand.directory_id).copied().unwrap_or_else(|| cand.deletable())
+            } else {
+                cand.deletable()
+            };
+            self.results.push(DirRowUi { candidate: cand, checked });
+        }
+    }
+
     fn back_to_list(&mut self) {
         self.selected = None;
+        self.selected_root = None;
         self.results.clear();
         self.reload_apps();
     }
@@ -225,7 +370,8 @@ impl App {
         self.apps.clear();
         match open_db(&self.config.ledger_path) {
             Ok(db) => {
-                self.db = Some(db);
+                self.db = Some(std::sync::Arc::new(db));
+                self.symlink.set_db(self.db.as_ref().unwrap().clone());
                 self.status = format!("账本已切换: {}", self.config.ledger_path.display());
                 self.reload_roots();
                 self.reload_apps();
@@ -271,12 +417,15 @@ impl App {
             }
             Err(e) => self.status = format!("删除失败: {e}"),
         }
-        // 先刷新总览聚合（会重建 apps 列表），再重新打开当前程序详情：
+        // 先刷新总览聚合（会重建 apps / root_groups 列表），再重新打开当前明细：
         // 已删除的目录（账本状态 Missing）不再显示在明细里。
-        let current = self.selected;
+        let current_app = self.selected;
+        let current_root = self.selected_root.clone();
         self.reload_apps();
-        if let Some(id) = current {
+        if let Some(id) = current_app {
             self.open_app(id, false);
+        } else if let Some(root) = current_root {
+            self.open_root(&root, false);
         }
     }
 }
@@ -321,21 +470,31 @@ impl eframe::App for App {
         // 实时刷新: 每 2 秒从账本拉取最新数据 (WAL 支持与后台 core 并发读写)。
         if self.last_refresh.elapsed() >= std::time::Duration::from_secs(2) {
             self.last_refresh = std::time::Instant::now();
-            match self.selected {
-                Some(id) => self.open_app(id, true),
-                None => self.reload_apps(),
+            if let Some(id) = self.selected {
+                self.open_app(id, true);
+            } else if let Some(root) = self.selected_root.clone() {
+                self.open_root(&root, true);
+            } else {
+                self.reload_apps();
             }
             self.reload_roots();
         }
-        ctx.request_repaint_after(std::time::Duration::from_secs(2));
+        ctx.request_repaint_after(if self.tab == Tab::Symlink && self.symlink.is_busy() {
+            std::time::Duration::from_millis(80)
+        } else {
+            std::time::Duration::from_secs(2)
+        });
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Ledger, "账本总览");
                 ui.selectable_value(&mut self.tab, Tab::Roots, "监视目录");
                 ui.selectable_value(&mut self.tab, Tab::Settings, "设置");
+                ui.selectable_value(&mut self.tab, Tab::RegLedger, "注册表账本");
+                ui.selectable_value(&mut self.tab, Tab::Symlink, "符号链接");
                 if ui.button("刷新").clicked() {
                     self.reload_apps();
                     self.reload_roots();
+                    self.reload_reg_apps();
                     self.status = "已刷新".into();
                 }
             });
@@ -349,6 +508,11 @@ impl eframe::App for App {
             Tab::Ledger => self.ui_ledger(ui),
             Tab::Roots => self.ui_roots(ui),
             Tab::Settings => self.ui_settings(ui),
+            Tab::RegLedger => self.ui_reg_ledger(ui),
+            Tab::Symlink => {
+                self.symlink.poll();
+                self.symlink.ui(ui);
+            }
         });
     }
 }
@@ -357,8 +521,13 @@ impl App {
     fn ui_ledger(&mut self, ui: &mut egui::Ui) {
         if let Some(app_id) = self.selected {
             self.ui_app_detail(ui, app_id);
+        } else if let Some(root) = self.selected_root.clone() {
+            self.ui_root_detail(ui, &root);
         } else {
-            self.ui_app_list(ui);
+            match self.ledger_view {
+                LedgerView::ByApp => self.ui_app_list(ui),
+                LedgerView::ByRoot => self.ui_root_list(ui),
+            }
         }
     }
 
@@ -369,6 +538,7 @@ impl App {
             self.apps.len(),
             total
         ));
+        self.ui_view_switch(ui);
         ui.label("点击某个程序查看它创建的目录并可删除。");
         ui.add_space(8.0);
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -390,6 +560,50 @@ impl App {
         });
     }
 
+    /// 总览顶部的分类方式切换开关。
+    fn ui_view_switch(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("分类方式:");
+            ui.selectable_value(&mut self.ledger_view, LedgerView::ByApp, "按程序 (exe)");
+            ui.selectable_value(&mut self.ledger_view, LedgerView::ByRoot, "按目录 (监视根)");
+        });
+    }
+
+    /// 按监视根分类的总览列表。
+    fn ui_root_list(&mut self, ui: &mut egui::Ui) {
+        let total: usize = self.root_groups.iter().map(|g| g.dir_count).sum();
+        ui.heading(format!(
+            "账本总览: {} 个监视目录, 累计 {} 条目录记录",
+            self.root_groups.len(),
+            total
+        ));
+        self.ui_view_switch(ui);
+        ui.label("点击某个监视目录查看其下捕获到的目录（含创建它的 exe），可勾选删除。");
+        ui.add_space(8.0);
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for g in self.root_groups.clone() {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(g.dir_count > 0, egui::Button::new("查看"))
+                        .clicked()
+                    {
+                        self.open_root(&g.root, false);
+                    }
+                    ui.vertical(|ui| {
+                        ui.label(format!(
+                            "{}  ({} 个目录, {} 个程序)",
+                            g.root, g.dir_count, g.exe_count
+                        ));
+                    });
+                });
+                ui.separator();
+            }
+            if self.root_groups.is_empty() {
+                ui.label("(尚未配置监视根目录; 到\"监视目录\"页添加)");
+            }
+        });
+    }
+
     fn ui_app_detail(&mut self, ui: &mut egui::Ui, app_id: i64) {
         let exe = self
             .apps
@@ -397,13 +611,30 @@ impl App {
             .find(|a| a.app_id == app_id)
             .map(|a| a.exe_path.clone())
             .unwrap_or_default();
+        let title = format!("该程序创建的目录 (共 {} 条)", self.results.len());
+        self.ui_dir_detail(ui, title, &exe, false);
+    }
+
+    fn ui_root_detail(&mut self, ui: &mut egui::Ui, root: &str) {
+        let title = format!("该监视目录下的目录 (共 {} 条)", self.results.len());
+        self.ui_dir_detail(ui, title, root, true);
+    }
+
+    /// 明细列表的共用界面; show_exe 为真时每行额外显示创建它的程序 (按目录视图)。
+    fn ui_dir_detail(
+        &mut self,
+        ui: &mut egui::Ui,
+        title: String,
+        subtitle: &str,
+        show_exe: bool,
+    ) {
         ui.horizontal(|ui| {
             if ui.button("← 返回总览").clicked() {
                 self.back_to_list();
             }
         });
-        ui.heading(format!("该程序创建的目录 (共 {} 条)", self.results.len()));
-        ui.monospace(&exe);
+        ui.heading(title);
+        ui.monospace(subtitle);
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if ui.button("全选").clicked() {
@@ -432,6 +663,9 @@ impl App {
                     }
                     ui.vertical(|ui| {
                         ui.label(&row.candidate.directory_path);
+                        if show_exe {
+                            ui.small(format!("创建者: {}", row.candidate.app_exe_path));
+                        }
                         ui.small(format!(
                             "创建于 {}  状态: {}  {}",
                             timefmt::format_local(row.candidate.created_at_ms),
@@ -562,8 +796,280 @@ impl App {
             }
         }
         ui.add_space(12.0);
-        ui.label("开机自启 (方案, 未自动安装):");
-        ui.monospace("schtasks /create /tn AppDirCore /sc onlogon /rl highest /tr \"<appdir-core.exe 完整路径>\"");
-        ui.label("建议把 appdir-core.exe 与 appdir-gui.exe 放在同一目录; appdir-core.exe 需管理员权限运行 (ETW)。");
+        ui.label("注册表监视 (只记录目录账本中已知 exe 的注册表写入; 修改后需重启 appdir-core.exe 生效):");
+        let cur = self.config.reg_mode_effective().to_string();
+        let mut mode = cur.clone();
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut mode, "off".to_string(), "关");
+            ui.selectable_value(&mut mode, "cache".to_string(), "cache (5 秒缓存)");
+            ui.selectable_value(&mut mode, "instant".to_string(), "instant (高性能)");
+        });
+        ui.small(match mode.as_str() {
+            "cache" => "cache: 事件缓存 5 秒后判定, 可覆盖“注册表先写、目录后建”的安装器。",
+            "instant" => "instant: 每条事件立即判定, 未命中目录账本直接丢弃; 内存几乎为零, 但不覆盖目标 exe 尚未建目录的场景。",
+            _ => "关: 不启动注册表 ETW 会话 (默认)。",
+        });
+        if mode != cur {
+            self.config.set_reg_mode(&mode);
+            match config::save(&self.config_path, &self.config) {
+                Ok(()) => {
+                    self.status = match mode.as_str() {
+                        "cache" => "已开启 cache 模式 (重启 appdir-core.exe 后生效)".into(),
+                        "instant" => "已开启 instant 模式 (重启 appdir-core.exe 后生效)".into(),
+                        _ => "已关闭注册表监视 (重启 appdir-core.exe 后生效)".into(),
+                    };
+                }
+                Err(e) => self.status = format!("保存配置失败: {e}"),
+            }
+        }
+        ui.add_space(12.0);
+        ui.label("开机自启 appdir-core.exe (登录后自动启动后台采集):");
+        let mut want = self.startup_checked;
+        if ui.checkbox(&mut want, "开机自启").changed() {
+            match startup::set_enabled(want) {
+                Ok(msg) => {
+                    self.startup_checked = startup::is_installed();
+                    self.status = msg;
+                }
+                Err(e) => self.status = format!("设置开机自启失败: {e}"),
+            }
+        }
+        if !self.startup_checked {
+            ui.label("提示: ETW 采集需要管理员权限; 若开关以注册表方式启用, ETW 可能拿不到管理员令牌。建议将两个 exe 放同一目录。");
+        }
+    }
+}
+
+/// 开机自启: 优先用计划任务 AppDirCore (schtasks, /rl highest), 失败则回退到
+/// HKCU Run 注册表项。开关状态 is_installed() 每次真实查询系统。
+mod startup {
+    use std::process::Command;
+
+    const TASK_NAME: &str = "AppDirCore";
+    const RUN_KEY: &str = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    const RUN_VALUE: &str = "AppDirCore";
+
+    fn core_exe() -> Option<String> {
+        let exe = std::env::current_exe().ok()?;
+        let core = exe.parent()?.join("appdir-core.exe");
+        if core.is_file() {
+            Some(core.display().to_string())
+        } else {
+            None
+        }
+    }
+
+    fn command_output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        cmd.output()
+    }
+
+    /// 当前是否已存在任一自启方案。
+    pub fn is_installed() -> bool {
+        task_exists().unwrap_or(false) || reg_value_exists().unwrap_or(false)
+    }
+
+    fn task_exists() -> std::io::Result<bool> {
+        let out = command_output(
+            Command::new("schtasks").args(["/query", "/tn", TASK_NAME]),
+        )?;
+        Ok(out.status.success())
+    }
+
+    fn reg_value_exists() -> std::io::Result<bool> {
+        let out = command_output(
+            Command::new("reg").args(["query", RUN_KEY, "/v", RUN_VALUE]),
+        )?;
+        Ok(out.status.success())
+    }
+
+    /// 开/关自启。返回给 UI 的提示文本。
+    pub fn set_enabled(enable: bool) -> Result<String, String> {
+        if enable {
+            let Some(target) = core_exe() else {
+                return Err("未找到同目录的 appdir-core.exe, 无法设置自启".into());
+            };
+            // 方案 A: 计划任务 (最高权限, ETW 需要)。非管理员会失败 -> 回退注册表。
+            let out = command_output(Command::new("schtasks").args([
+                "/create", "/tn", TASK_NAME, "/sc", "onlogon", "/rl", "highest", "/f",
+                "/tr", &format!("\\\"{target}\\\""),
+            ]))
+            .map_err(|e| e.to_string())?;
+            if out.status.success() {
+                return Ok("已创建计划任务 AppDirCore (开机自启, 最高权限)".into());
+            }
+            let out = command_output(Command::new("reg").args([
+                "add", RUN_KEY, "/v", RUN_VALUE, "/t", "REG_SZ", "/d", &target, "/f",
+            ]))
+            .map_err(|e| e.to_string())?;
+            if out.status.success() {
+                Ok("已写入 HKCU Run 注册表项 (注意: 此方式启动可能无管理员权限, ETW 不可用)".into())
+            } else {
+                Err(format!(
+                    "schtasks 与 reg add 均失败; schtasks: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ))
+            }
+        } else {
+            let mut msgs: Vec<String> = Vec::new();
+            if let Ok(out) = command_output(
+                Command::new("schtasks").args(["/delete", "/tn", TASK_NAME, "/f"]),
+            ) {
+                if out.status.success() {
+                    msgs.push("已删除计划任务 AppDirCore".into());
+                }
+            }
+            if let Ok(out) = command_output(
+                Command::new("reg").args(["delete", RUN_KEY, "/v", RUN_VALUE, "/f"]),
+            ) {
+                if out.status.success() {
+                    msgs.push("已删除 HKCU Run 注册表项".into());
+                }
+            }
+            if msgs.is_empty() {
+                Ok("未发现已安装的自启项".into())
+            } else {
+                Ok(msgs.join(", "))
+            }
+        }
+    }
+}
+
+// ---- 注册表账本 ----
+
+impl App {
+    fn ui_reg_ledger(&mut self, ui: &mut egui::Ui) {
+        if let Some(app_id) = self.reg_selected {
+            self.ui_reg_detail(ui, app_id);
+        } else {
+            self.ui_reg_list(ui);
+        }
+    }
+
+    fn reload_reg_apps(&mut self) {
+        self.reg_apps.clear();
+        self.reg_selected = None;
+        self.reg_rows.clear();
+        let Some(db) = &self.db else { return };
+        match db.reg_apps() {
+            Ok(a) => self.reg_apps = a,
+            Err(e) => self.status = format!("读取注册表账本失败: {e}"),
+        }
+    }
+
+    /// 打开某 exe 的注册表明细; 顺带静默清理注册表中已不存在的值条目
+    /// (op=set 且当前查不到该键值 -> 视为失效, 直接从账本删除)。
+    fn open_reg_detail(&mut self, app_id: i64) {
+        self.reg_selected = Some(app_id);
+        self.reload_reg_rows(app_id);
+    }
+
+    fn reload_reg_rows(&mut self, app_id: i64) {
+        self.reg_rows.clear();
+        let Some(db) = &self.db else { return };
+        let rows = match db.reg_events_of_app(app_id) {
+            Ok(r) => r,
+            Err(e) => {
+                self.status = format!("读取注册表记录失败: {e}");
+                return;
+            }
+        };
+        let stale: Vec<i64> = rows
+            .iter()
+            .filter(|r| r.op == "set" && !regcheck::value_exists(&r.key_path, &r.value_name))
+            .map(|r| r.reg_id)
+            .collect();
+        if !stale.is_empty() {
+            match db.reg_delete_ids(&stale) {
+                Ok(n) if n > 0 => self.status = format!("已静默清理 {n} 条注册表中已不存在的条目"),
+                Ok(_) => {}
+                Err(e) => self.status = format!("清理失效条目失败: {e}"),
+            }
+        }
+        self.reg_rows = rows.into_iter().filter(|r| !stale.contains(&r.reg_id)).collect();
+    }
+
+    fn ui_reg_list(&mut self, ui: &mut egui::Ui) {
+        let total: i64 = self.reg_apps.iter().map(|a| a.event_count).sum();
+        ui.heading(format!(
+            "注册表账本: {} 个程序, 共 {total} 条记录",
+            self.reg_apps.len()
+        ));
+        ui.label("只收录目录账本中已知 exe 的注册表写入 (需在设置中开启注册表监视并重启 core)。点击查看可静默清理已失效条目。");
+        ui.add_space(8.0);
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for a in self.reg_apps.clone() {
+                ui.horizontal(|ui| {
+                    if ui.button("查看").clicked() {
+                        self.open_reg_detail(a.app_id);
+                    }
+                    ui.label(format!("{}  ({} 条)", a.exe_name, a.event_count));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.small(&a.exe_path);
+                    });
+                });
+                ui.separator();
+            }
+        });
+    }
+
+    fn ui_reg_detail(&mut self, ui: &mut egui::Ui, app_id: i64) {
+        if ui.button("← 返回").clicked() {
+            self.reg_selected = None;
+            return;
+        }
+        ui.add_space(4.0);
+        if let Some(a) = self.reg_apps.iter().find(|a| a.app_id == app_id) {
+            ui.heading(format!("{} 的注册表记录 ({} 条)", a.exe_name, a.event_count));
+            ui.small(&a.exe_path);
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui.button("刷新").clicked() {
+                self.open_reg_detail(app_id);
+            }
+            if ui.button("清空该程序记录").clicked() {
+                let res = self.db.as_ref().map(|db| db.reg_delete_app(app_id));
+                match res {
+                    Some(Ok(n)) => self.status = format!("已清空 {n} 条记录"),
+                    Some(Err(e)) => self.status = format!("清空失败: {e}"),
+                    None => {}
+                }
+                self.reload_reg_apps();
+                return;
+            }
+        });
+        ui.add_space(4.0);
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for r in self.reg_rows.clone() {
+                ui.horizontal(|ui| {
+                    ui.monospace(format!(
+                        "[{}] {}{}",
+                        if r.op == "set" { "写" } else { "删值" },
+                        r.key_path,
+                        if r.value_name.is_empty() { String::new() } else { format!("\\{}", r.value_name) },
+                    ));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small("删除").clicked() {
+                            let res = self.db.as_ref().map(|db| db.reg_delete_ids(&[r.reg_id]));
+                            match res {
+                                Some(Ok(n)) if n > 0 => {
+                                    self.reg_rows.retain(|x| x.reg_id != r.reg_id);
+                                    let _ = n;
+                                }
+                                Some(Ok(_)) => {}
+                                Some(Err(e)) => self.status = format!("删除失败: {e}"),
+                                None => {}
+                            }
+                        }
+                        ui.small(timefmt::format_local(r.event_at_ms));
+                    });
+                });
+            }
+        });
     }
 }

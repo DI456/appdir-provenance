@@ -5,6 +5,7 @@ pub mod filter;
 pub mod ledger;
 pub mod path;
 pub mod query;
+pub mod regcheck;
 pub mod selftest;
 pub mod source;
 pub mod timefmt;
@@ -18,7 +19,7 @@ pub use clean::{
     backup_tree, clean_one, execute, plan_for_exe, read_identity, remove_tree, verify, Action, ActionItem,
     BlockReason, Candidate, CleanOptions, CleanReport, DirIdentity,
 };
-pub use db::{AppRow, Db, DirRow, IgnoredRow, InsertOutcome};
+pub use db::{AppRow, Db, DirRow, IgnoredRow, InsertOutcome, RegAppSummary, RegRow, SymlinkRecord};
 pub use filter::{admit, CreateRequest, MonitorView, Verdict};
 pub use ledger::{raw, IngestOutcome, Ledger};
 pub use query::{ExeQuery, QueryItem};

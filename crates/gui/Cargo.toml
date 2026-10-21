@@ -12,3 +12,4 @@ path = "src/main.rs"
 [dependencies]
 appdir-core = { path = "../core" }
 eframe = { version = "0.28", default-features = false, features = ["glow", "default_fonts"] }
+rfd = "0.14"

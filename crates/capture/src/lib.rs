@@ -6,9 +6,11 @@
 //! minifilter comms source can be dropped in without touching storage, query or cleanup.
 
 pub mod etw;
+pub mod registry;
 pub mod watch;
 
 pub use etw::EtwSource;
+pub use registry::{RegistryEvent, RegistrySource, RegStats};
 pub use watch::{WatchSource, WatchStatus};
 
 use appdir_core::{IgnoreReason, RawCreateEvent};

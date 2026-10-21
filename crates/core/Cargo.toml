@@ -9,3 +9,4 @@ description = "User-mode core: path rules, create-event filter, SQLite ledger, q
 rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
 serde_json = "1"
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_Registry"] }

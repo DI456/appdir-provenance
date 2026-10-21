@@ -322,7 +322,7 @@ extern "system" fn proc_callback(event_ptr: *mut windows::Win32::System::Diagnos
                 .chunks_exact(2)
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
-            let text: String = words.iter().map(|w| char::from_u32(*w as u32).filter(|c| !c.is_control()).unwrap_or('.')).collect();
+            let _text: String = words.iter().map(|w| char::from_u32(*w as u32).filter(|c| !c.is_control()).unwrap_or('.')).collect();
             let dev_idx = words.windows(8).position(|w| {
                 u16_lower(w[0]) == b'\\' as u16 && u16_lower(w[1]) == b'D' as u16
             });

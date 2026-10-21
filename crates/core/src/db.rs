@@ -7,7 +7,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::Mutex;
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Clone)]
 pub struct AppRow {
@@ -39,6 +39,35 @@ pub struct IgnoredRow {
     pub directory_path: DbPath,
     pub creator_pid: u32,
     pub exe_path: Option<DbPath>,
+}
+
+/// 注册表账本中的一条记录 (对应 registry_events 行)。
+#[derive(Debug, Clone)]
+pub struct RegRow {
+    pub reg_id: i64,
+    pub app_id: i64,
+    pub pid: u32,
+    pub op: String,
+    pub key_path: String,
+    pub value_name: String,
+    pub event_at_ms: i64,
+}
+
+/// 注册表账本按 exe 聚合的概览行。
+#[derive(Debug, Clone)]
+pub struct RegAppSummary {
+    pub app_id: i64,
+    pub exe_path: String,
+    pub exe_name: String,
+    pub event_count: i64,
+}
+
+/// 符号链接账本中的一条记录 (GUI 符号链接页签创建时写入)。
+#[derive(Debug, Clone)]
+pub struct SymlinkRecord {
+    pub link_path: DbPath,
+    pub target_path: DbPath,
+    pub created_at_ms: i64,
 }
 
 /// One connection, guarded so the daemon thread and the CLI can share it.
@@ -87,6 +116,13 @@ CREATE TABLE IF NOT EXISTS directories (
     record_status  TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS symlink_records (
+    record_id     INTEGER PRIMARY KEY,
+    link_path     TEXT NOT NULL UNIQUE,
+    target_path   TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_directories_app    ON directories(app_id);
 CREATE INDEX IF NOT EXISTS idx_directories_status ON directories(record_status);
 CREATE INDEX IF NOT EXISTS idx_applications_name  ON applications(exe_name);
@@ -101,6 +137,20 @@ CREATE TABLE IF NOT EXISTS ignored_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_ignored_reason ON ignored_events(reason);
+
+CREATE TABLE IF NOT EXISTS registry_events (
+    reg_id        INTEGER PRIMARY KEY,
+    app_id        INTEGER NOT NULL REFERENCES applications(app_id) ON DELETE CASCADE,
+    pid           INTEGER NOT NULL,
+    op            TEXT NOT NULL,
+    key_path      TEXT NOT NULL,
+    value_name    TEXT NOT NULL,
+    event_at_ms   INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_reg_app ON registry_events(app_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reg_dedup
+    ON registry_events(app_id, op, key_path, value_name);
 "#;
 
 impl Db {
@@ -182,6 +232,55 @@ impl Db {
             )
             .map_err(|e| Error::Sqlite(e.to_string()))?;
         Ok((row, changed == 1))
+    }
+
+    // ---- 符号链接记录 (GUI 符号链接页签) ----
+
+    /// 记录一次符号链接创建; 同一 link_path 重复创建时覆盖旧记录。
+    pub fn add_symlink_record(&self, link_path: &str, target_path: &str) -> Result<()> {
+        let db = self.lock();
+        db.execute(
+            "INSERT INTO symlink_records(link_path, target_path, created_at_ms) VALUES(?1, ?2, ?3)
+             ON CONFLICT(link_path) DO UPDATE SET
+               target_path = excluded.target_path,
+               created_at_ms = excluded.created_at_ms",
+            params![link_path, target_path, crate::timefmt::now_ms()],
+        )
+        .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn symlink_records(&self) -> Result<Vec<SymlinkRecord>> {
+        let db = self.lock();
+        let mut st = db
+            .prepare(
+                "SELECT link_path, target_path, created_at_ms
+                 FROM symlink_records ORDER BY created_at_ms DESC, record_id DESC",
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        let rows = st
+            .query_map([], |r| {
+                Ok(SymlinkRecord {
+                    link_path: r.get(0)?,
+                    target_path: r.get(1)?,
+                    created_at_ms: r.get(2)?,
+                })
+            })
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    /// 删除指定 link_path 的记录, 返回删除行数。
+    pub fn delete_symlink_records(&self, links: &[String]) -> Result<usize> {
+        let db = self.lock();
+        let mut n = 0;
+        for l in links {
+            n += db
+                .execute("DELETE FROM symlink_records WHERE link_path = ?1", params![l])
+                .map_err(|e| Error::Sqlite(e.to_string()))?;
+        }
+        Ok(n)
     }
 
     pub fn remove_root(&self, raw: &str) -> Result<bool> {
@@ -275,6 +374,129 @@ impl Db {
         )
         .optional()
         .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    // ---- 注册表账本 (registry_events) ----
+
+    /// 目录账本中所有已归属 exe 的 (exe_key, app_id)。
+    /// 注册表采集用它一次性建内存索引, 避免每条事件查一次 SQLite。
+    pub fn known_apps(&self) -> Result<Vec<(String, i64)>> {
+        let db = self.lock();
+        let mut stmt = db
+            .prepare("SELECT exe_key, app_id FROM applications")
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(|e| Error::Sqlite(e.to_string()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(rows)
+    }
+
+    /// exe 路径是否已被目录监视捕获过 (在 applications 表中); 命中返回 app_id。
+    pub fn reg_known_app(&self, exe_path: &str) -> Result<Option<i64>> {
+        let lower = exe_path.to_ascii_lowercase();
+        let db = self.lock();
+        db.query_row(
+            "SELECT app_id FROM applications WHERE exe_key = ?1 OR exe_key = ?2",
+            params![exe_path, lower],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|e| Error::Sqlite(e.to_string()))
+    }
+
+    /// 插入注册表事件。同 app+op+键+值 视为同一条, 重复写入忽略。
+    /// 返回是否新插入了行。
+    pub fn reg_insert(
+        &self,
+        app_id: i64,
+        pid: u32,
+        op: &str,
+        key_path: &str,
+        value_name: &str,
+        at_ms: i64,
+    ) -> Result<bool> {
+        let db = self.lock();
+        let n = db
+            .execute(
+                "INSERT OR IGNORE INTO registry_events(app_id, pid, op, key_path, value_name, event_at_ms)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                params![app_id, pid, op, key_path, value_name, at_ms],
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(n > 0)
+    }
+
+    /// 按 exe 聚合的注册表账本概览。
+    pub fn reg_apps(&self) -> Result<Vec<RegAppSummary>> {
+        let db = self.lock();
+        let mut stmt = db
+            .prepare(
+                "SELECT a.app_id, a.exe_path, a.exe_name, COUNT(r.reg_id) AS cnt
+                   FROM registry_events r JOIN applications a ON a.app_id = r.app_id
+                  GROUP BY a.app_id ORDER BY cnt DESC, a.exe_name",
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(RegAppSummary {
+                    app_id: r.get(0)?,
+                    exe_path: r.get(1)?,
+                    exe_name: r.get(2)?,
+                    event_count: r.get(3)?,
+                })
+            })
+            .map_err(|e| Error::Sqlite(e.to_string()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(rows)
+    }
+
+    /// 某 exe 的全部注册表记录。
+    pub fn reg_events_of_app(&self, app_id: i64) -> Result<Vec<RegRow>> {
+        let db = self.lock();
+        let mut stmt = db
+            .prepare(
+                "SELECT reg_id, app_id, pid, op, key_path, value_name, event_at_ms
+                   FROM registry_events WHERE app_id = ?1 ORDER BY event_at_ms DESC, reg_id DESC",
+            )
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![app_id], |r| {
+                Ok(RegRow {
+                    reg_id: r.get(0)?,
+                    app_id: r.get(1)?,
+                    pid: r.get::<_, i64>(2)? as u32,
+                    op: r.get(3)?,
+                    key_path: r.get(4)?,
+                    value_name: r.get(5)?,
+                    event_at_ms: r.get(6)?,
+                })
+            })
+            .map_err(|e| Error::Sqlite(e.to_string()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Sqlite(e.to_string()))?;
+        Ok(rows)
+    }
+
+    /// 删除指定 reg_id 的记录, 返回实际删除数。
+    pub fn reg_delete_ids(&self, ids: &[i64]) -> Result<usize> {
+        let db = self.lock();
+        let mut n = 0;
+        for id in ids {
+            n += db
+                .execute("DELETE FROM registry_events WHERE reg_id = ?1", params![id])
+                .map_err(|e| Error::Sqlite(e.to_string()))?;
+        }
+        Ok(n)
+    }
+
+    /// 清空某 exe 的全部注册表记录 (不动 applications/directories)。
+    pub fn reg_delete_app(&self, app_id: i64) -> Result<usize> {
+        let db = self.lock();
+        db.execute("DELETE FROM registry_events WHERE app_id = ?1", params![app_id])
+            .map_err(|e| Error::Sqlite(e.to_string()))
     }
 
     pub fn app_by_id(&self, app_id: i64) -> Result<Option<AppRow>> {
