@@ -7,6 +7,10 @@ Windows 目录溯源与清理工具。
 
 所有数据都保存在本机，不联网、不上传。
 
+![appdir-provenance 主界面](docs/images/main-window.png)
+
+> 账本总览支持「按程序 (exe)」与「按目录 (监视根)」两种视图，可随时切换。
+
 ---
 
 ## 功能一览
