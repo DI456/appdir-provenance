@@ -1,122 +1,301 @@
 # appdir-provenance
 
-Windows 应用目录溯源与清理工具。监视指定根目录（表层**直接子目录**创建），通过 ETW
-记录创建者 EXE 完整路径，写入 SQLite 账本；支持按 EXE 反查、备份+两步删除。
+Windows 目录溯源与清理工具。
 
-> 本 README 面向**未来要在此项目上继续开发功能的 AI/工程师**：先读完
-> 「架构」和「已验证事实/坑」再动手，可以避免踩一遍已经踩过的雷。
+它会监视你指定的文件夹，记录**哪个程序在其下新建了哪个子目录**，并把结果写入本地 SQLite 账本。
+之后你可以按程序或按监视目录回看这些痕迹，并在确认后安全地清理不再需要的目录。
 
-## 架构（双 exe + 三个库）
+所有数据都保存在本机，不联网、不上传。
+
+---
+
+## 功能一览
+
+### 目录账本
+- 监视指定根目录，只记录**根目录的直接子目录**创建事件（不递归）。
+- 通过 ETW 捕获创建动作，并解析出创建者的完整 EXE 路径。
+- 使用独立的目录监听确认“确实是新建”，避免把“打开已有目录”误记为创建。
+- 记录创建时间、创建者、监视根、来源与状态。
+- **两种总览视图**：按程序（exe）分类，或按监视根（目录）分类。
+- 明细页可查看每个目录的创建时间与当前状态。
+
+### 安全清理
+- 只清理账本中有归属、且校验通过的目录。
+- 默认先备份整棵目录树，再隔离重命名，最后删除。
+- 路径受保护、创建者不符、创建时间不符、符号链接/重解析点、被占用或无权限的条目会被拦截，不可勾选删除。
+- GUI 中需手动勾选并点击“删除选中”才会执行；不勾选不会动任何文件。
+
+### 注册表账本（可选）
+- 监视已知程序的注册表写入（键、值、时间）。
+- 三种模式：关闭 / cache（5 秒缓存，覆盖“先写注册表、后建目录”的安装器）/ instant（即时判定，内存占用最小）。
+- 只收录目录账本中已出现的程序，不会把全系统注册表活动都存下来。
+- 打开明细时会自动清理已经失效的条目。
+
+### 符号链接工具
+- 批量选择文件或文件夹，在目标文件夹 B 的下一级创建同名符号链接，原件不动。
+- “移动并创建”：先把源移动到 B，再在原位置创建指向新位置的链接。
+- 同盘默认使用相对链接，跨盘自动回退为绝对链接。
+- 可选“遇到占用自动解锁”：结束占用进程后重试；仍失败则中止并回滚已移动的文件。
+- 历史记录中可删除链接本身，不会删除文件本体。
+
+### 其他
+- 开机自启：登录后自动启动后台采集。
+- 账本路径、删除前备份、注册表监视模式均可在界面中设置。
+
+---
+
+## 系统要求
+
+- Windows 10 / Windows 11（64 位）
+- 后台采集需要**管理员权限**（ETW 会话要求）
+- 无需安装其他软件；若系统提示缺少 `VCRUNTIME140.dll`，安装 Microsoft Visual C++ 2015–2022 运行库（x64）
+
+---
+
+## 安装
+
+程序为绿色版，不需要安装程序。
+
+1. 下载 Release 中的两个文件：
+   - `appdir-core.exe`：后台采集进程
+   - `appdir-gui.exe`：图形界面
+2. **把两个 exe 放在同一个文件夹中**，例如 `D:\Tools\appdir`。
+3. 建议放在普通可写目录，不要放在 `C:\Program Files` 下（程序需要在同目录写入配置和账本）。
+4. 首次运行如果出现 Windows SmartScreen 提示：点击“更多信息”→“仍要运行”。
+
+> 两个 exe 必须保持在同一目录：它们共享同目录下的 `appdir.json` 与 `ledger.db`，
+> 且“开机自启”也依赖同目录的 `appdir-core.exe`。
+
+首次运行会自动创建：
+
+| 文件 | 用途 |
+| --- | --- |
+| `appdir.json` | 配置文件（账本路径、备份开关、注册表模式等） |
+| `ledger.db` | SQLite 账本（运行时还会生成 `ledger.db-wal`、`ledger.db-shm`） |
+| `backups\` | 删除前的备份目录（执行过清理后出现） |
+
+---
+
+## 快速开始
+
+1. 双击 `appdir-gui.exe` 打开界面。
+2. 进入 **监视目录** 页，输入要监视的文件夹绝对路径（例如 `D:\Downloads`），点击“添加”，并确认前面的勾选框已启用。
+3. **以管理员身份运行 `appdir-core.exe`**，后台采集随即开始（控制台窗口会在几秒后自动隐藏）。
+4. 正常安装或运行软件，让它们在监视目录下创建子目录。
+5. 回到 GUI 的 **账本总览**，点击“刷新”即可看到记录。
+
+希望登录后自动采集：**以管理员身份运行 `appdir-gui.exe`**，在 **设置** 页勾选“开机自启”。
+程序会优先创建计划任务 `AppDirCore`（登录时以最高权限启动）；如果不是以管理员身份打开 GUI，
+创建计划任务会失败并回退到当前用户的启动项，此时 ETW 可能拿不到管理员令牌。
+可先取消自启，再用管理员身份重新开启以使用计划任务方式。
+
+---
+
+## 界面说明
+
+### 账本总览
+
+顶部提供两种分类方式，可随时切换：
+
+- **按程序 (exe)**：每个程序一行，显示它创建了多少个目录。
+- **按目录 (监视根)**：每个监视目录一行，显示该目录下捕获到多少个子目录、涉及多少个程序。已配置但没有记录的根目录也会显示。
+
+点击“查看”进入明细：
+
+- 每行显示目录完整路径、创建时间、当前状态；按目录视图还会显示创建者 EXE。
+- 可删除的条目才有勾选框；被拦截的条目显示 ⛔ 并在行内说明原因。
+- 使用“全选 / 全不选”后点击“删除选中”执行清理。
+- 已不存在的目录不会继续显示在明细中。
+
+界面每 2 秒自动刷新一次，也可以点击顶部的“刷新”按钮。
+
+### 监视目录
+
+- “添加”：加入一个绝对路径作为监视根。
+- 勾选框：启用/停用该根目录的采集。
+- “移除”：从配置中删除该根目录（不会删除账本历史记录，也不会删除磁盘文件）。
+
+注意：只监视根目录下的**直接子目录**。例如监视 `D:\Downloads` 时，
+`D:\Downloads\App\Sub` 会记录 `App`，但不会单独记录 `Sub`；更下层的创建不会被采集。
+
+### 设置
+
+- **账本 SQLite 路径**：修改后点击“保存并重新打开账本”。后台 `appdir-core.exe` 需要重启后才会使用新路径。
+- **删除前备份**：默认开启。备份保存在程序目录的 `backups\<目录名>-<时间戳>`。
+- **注册表监视**：关 / cache / instant。修改后需要重启 `appdir-core.exe`。
+- **开机自启**：为 `appdir-core.exe` 创建登录启动项。
+
+### 注册表账本
+
+- 列出目录账本中已知程序产生的注册表写入。
+- 点击“查看”进入明细，可按条目删除，或“清空该程序记录”。
+- 打开明细时会静默清理已经不存在的注册表值。
+- 使用此功能前，需要先在设置中开启注册表监视并重启后台进程。
+
+### 符号链接
+
+**操作**页：
+
+1. 点击“添加文件…”或“添加文件夹…”，可多次添加、混合添加。
+2. 选择目标文件夹 B（可手输或点击“选择目标文件夹…”）。
+3. 选择执行方式：
+   - **创建**：在 B 的下一级为每个源创建同名链接，原件留在原位置。
+   - **移动并创建**：先把源移动到 B 的下一级，再在原位置创建指向新位置的链接。
+4. 点击执行后可在进度区查看状态，执行过程中可取消任务。
+
+“遇到占用自动解锁”默认开启，仅对“移动并创建”生效：
+当文件被其他进程占用导致移动失败时，工具会结束占用进程后重试；如果仍然失败，
+会中止整批操作并回滚已经移动的文件。**此选项会强制结束进程，请确认可接受后再使用。**
+
+**历史记录**页：
+
+- 列出本工具创建过的链接位置、本体位置、创建时间与当前状态。
+- 勾选“删除选中”只会移除符号链接本身，不会删除文件本体。
+
+---
+
+## 数据文件与备份
+
+所有运行数据都在两个 exe 所在的目录：
+
+- `appdir.json`：配置。不要用带 BOM 的编码保存；否则程序会报 JSON 解析失败。
+- `ledger.db`：账本。运行时还有 `ledger.db-wal` 和 `ledger.db-shm`。
+  **这三个文件是一个整体**，备份或迁移时请一起复制；不要在程序运行时单独删除 `-wal`/`-shm`。
+- `backups\`：清理前的备份。确认无需恢复后可自行删除。
+
+迁移到新位置：先退出 GUI，并在任务管理器中结束 `appdir-core.exe`，再把整个文件夹（含 WAL 文件）复制走。
+
+---
+
+## 命令行（可选，需自行构建）
+
+Release 只包含两个 exe。`appdir.exe` 是开发/诊断用命令行前端，需要从源码构建：
 
 ```
-crates/
-  core/       appdir-core 库：路径规则(filter/path)、SQLite 账本(db/ledger)、
-              安全清理(clean: 备份+两步删除)、查询(query)、共享配置(config)
-  capture/    事件来源库：
-              - etw.rs  ETW 来源（主来源，需管理员）
-              - watch.rs ReadDirectoryChangesW 目录出现监听（确认器，无创建者信息）
-  daemon/     appdir-core.exe  无窗口常驻后台采集进程（etw -> 账本）
-  gui/        appdir-gui.exe  按需 GUI (eframe/egui, 纯 Rust, release 无控制台)
-  cli/        appdir.exe      命令行前端（开发/诊断用，功能与 GUI 重叠）
-driver/       Minifilter 驱动源码（未编译加载，见 docs/MINIFILTER.md）
-deploy/       部署目录：两个 exe + appdir.json + ledger.db + backups/（运行数据，勿删）
+cargo build --release -p appdir-cli
 ```
 
-- **不要改 core/capture 已验证的账本、删除、ETW 逻辑**；加功能优先在 daemon/gui/cli
-  层做，或新增文件。
-- 所有业务逻辑只在 core/capture；GUI 与 CLI 只是壳，直接调用
-  `Db / ExeQuery / clean::*`，不重复实现。
+常用命令：
 
-## 路径约定（core 与 GUI 共享）
+```
+appdir monitor add <目录>              添加监视根
+appdir monitor list                    列出监视根
+appdir monitor enable|disable <目录>   启用/停用
+appdir query exe <EXE完整路径>         查询某程序创建的目录
+appdir query directory <目录路径>      查询某个目录的归属
+appdir query all                       列出账本
+appdir query ignored                   查看被丢弃的事件及原因
+appdir clean --exe <EXE完整路径>       清理（默认 dry-run）
+appdir clean --directory <目录路径>
+     选项: --dry-run(默认) --backup --yes --max N
+appdir daemon [--source watch|etw] [--seconds N]
+appdir status | reconcile | selftest | version | help
+```
 
-- 两个 exe 放同一目录；`appdir.json`（含 `ledger_path`）与 `ledger.db` 默认在 exe 同目录。
-- GUI 修改账本路径 → 写 `appdir.json`；后台 core 重启后生效。
-- 监视根目录列表存在账本 `monitor_roots` 表（不是 JSON）。
+`appdir selftest` 会在临时沙箱中走一遍“创建 → 采集 → 记账 → 查询 → 清理”，不会触碰真实用户数据。
+`clean` 默认只预览；真正删除需要 `--yes`，建议同时加 `--backup`。
 
-## 构建与运行
+命令行使用独立的数据目录：默认 `%LOCALAPPDATA%\appdir-provenance`，
+可用环境变量 `APPDIR_DATA_DIR` 或 `--data-dir` 覆盖。它**不会**自动使用 GUI 同目录下的账本，
+除非显式指定。
+
+---
+
+## 常见问题
+
+**采集不到新目录？**
+
+- 确认根目录已添加并且处于启用状态。
+- 只记录根目录的直接子目录；更深层目录不会单独记录。
+- 确认 `appdir-core.exe` 正在运行，且以管理员身份启动。
+- 若账本路径或注册表模式被修改过，重启 `appdir-core.exe`。
+
+**“开机自启”后没有采集到数据？**
+
+优先使用计划任务方式（设置时会请求管理员权限）。如果回退到当前用户启动项，
+程序可能无法获得管理员令牌，表现为 ETW 启动失败。可删除自启后以管理员身份重新设置，
+或手动以管理员身份运行 `appdir-core.exe`。
+
+**关闭 GUI 后还会继续采集吗？**
+
+会。GUI 只是查看和配置界面；采集由 `appdir-core.exe` 独立完成。
+
+**为什么有些目录没有创建者？**
+
+创建者进程过短、解析失败或事件被过滤时，记录会被丢弃并计入忽略事件。
+可用 `appdir query ignored` 查看原因。
+
+**杀毒软件或 SmartScreen 报警？**
+
+程序使用 ETW 和进程枚举，发布包未做代码签名，可能触发启发式告警。
+可自行从源码构建。
+
+**强制结束进程后采集异常？**
+
+可能残留 ETW 会话。以管理员身份执行：
+
+```
+logman query -ets | findstr appdir
+logman stop <会话名> -ets
+```
+
+**注册表账本为空？**
+
+注册表监视默认关闭；需要在设置中选择 cache 或 instant 并重启 `appdir-core.exe`。
+并且只记录目录账本中已出现的程序。
+
+---
+
+## 卸载
+
+1. 在设置中关闭“开机自启”（或手动删除计划任务 `AppDirCore` / 启动项）。
+2. 退出 GUI，在任务管理器中结束 `appdir-core.exe`。
+3. 删除整个程序文件夹即可。
+
+如需保留历史记录，请先备份 `ledger.db`（连同 `-wal`、`-shm`）和 `backups\`。
+
+---
+
+## 已知限制
+
+- 只采集监视根的一级子目录，不递归。
+- 注册表监视依赖 ETW 冷启动时的键句柄解析，部分事件无法还原完整键名（原理性损耗）。
+- 注册表前缀过滤目前只能在 `appdir.json` 的 `reg_prefixes` 中配置，GUI 未提供编辑入口。
+- 注册表明细在条目很多时，打开会逐条检查有效性，可能有短暂卡顿。
+- 不追踪服务调用链、RPC 归属或完整进程树。
+- 未实现内核驱动方案，当前全部为用户态。
+
+---
+
+## 从源码构建
+
+需要 Rust 工具链（MSVC 目标）和 Windows SDK：
 
 ```powershell
-$env:CARGO_HOME='D:\toss pc\rubbish-from-C\.cargo'
-$env:RUSTUP_HOME='D:\toss pc\rubbish-from-C\.rustup'
-cargo build --release --workspace     # 产物: target\release\{appdir-core,appdir-gui,appdir}.exe
-cargo test --workspace                # 全部测试必须通过
+cargo build --release --workspace
+cargo test --workspace
 ```
 
-- `appdir-core.exe` 必须管理员运行（ETW 需要）；`--config <appdir.json>` 可覆盖配置路径。
-- 开机自启方案（未安装）：`schtasks /create /tn AppDirCore /sc onlogon /rl highest /tr "<exe 路径>"`。
-  不要用 HKCU Run（UAC 下拿不到管理员令牌）。
+产物位于 `target\release\`：
 
-## 已验证事实 / 大坑（2026-10-18，真机实测，勿凭文档推翻）
+- `appdir-core.exe`
+- `appdir-gui.exe`
+- `appdir.exe`（命令行，可选）
 
-### ETW Kernel-File 会话（etw.rs）
-1. Provider GUID `{EDD08927-9CC4-4E65-B970-C2560FB5C289}`，走**经典 EventCallback +
-   MofData**（`EventRecordCallback` 在本机对内核 provider 的 UserData 为 null）。
-2. Create(12) payload（version 0）= `Irp(8) ThreadId(8) FileObject(8) CreateOptions(u32)
-   CreateAttributes(u32) ShareAccess(u32) FileName(utf16z 设备路径)`。TDH 在本机查不到
-   schema（ERROR_NOT_FOUND），只能按此布局裸解析；解析失败计数丢弃，**绝不猜**。
-3. Create 事件不能区分"新建/打开已有目录"，必须由 watch.rs 的非递归
-   `FILE_ACTION_ADDED` 确认后才记账（确认窗口 15s）。
-4. Kernel-File 事件只带 PID；创建者镜像路径解析顺序：进程句柄 → 进程缓存 → 3s 宽限重试
-   → 仍无则丢弃（`no_creator`）。
+发布时只需分发前两个 exe，并保持它们在同一目录。
 
-### 并行 Kernel-Process 会话（方案 1，短命进程归属的关键）
-1. Provider GUID `{22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}`，同样走 EventCallback + MofData。
-2. **EnableTraceEx2 必须 level=5(VERBOSE) + keyword 0x10(WINEVENT_KEYWORD_PROCESS)**。
-   实测：keyword=全量会收 ~1.4k 事件/秒（线程等噪音，延迟大到短命进程等不到）；
-   level=4 + keyword 0x10 会收到 0 条事件。这两个组合都踩过坑。
-3. ProcessStart(Class.Type=1) payload 实测布局：
-   `u32 pid, u32 parent?, u32 0, FILETIME(8), u32 session, u32 parent2, ...,
-   utf16z 镜像路径(\Device\HarddiskVolumeN\... 或 X:\...)`。
-   **payload 里有完整镜像路径**——曾误判"没有路径"，实际是解析器只认盘符格式 + 一个
-   大小写比较 bug（`is_word` 把 word 转小写却和 UPPER 常量比较，`'D'` 永远匹配不上）。
-   解析用 `extract_proc_fields`（有真机 payload 回归测试）。
-4. 两个 ETW 会话间事件到达顺序无保证：文件事件可能先于 ProcessStart 被处理，
-   所以有 3 秒宽限期重试（drain 里 grace 列表）。宽限到期仍无归属才 `no_creator` 丢弃。
-5. 强杀 core 会残留 `appdir-etw-<pid>` / `appdir-proc-<pid>` ETW 会话，残留会话会干扰
-   新会话收事件。调试时用 `logman query -ets | findstr appdir` 检查，
-   `logman stop <名字> -ets` 清理。
+---
 
-### 账本 (core/src/db.rs)
-- schema v2，`capture_source` + `attribution_confidence` 列，旧库自动迁移。
-- `attribution_confidence = etw-create-confirmed`（ETW+监听双确认）。
+## 更多文档
 
-### 清理 (core/src/clean.rs)
-- 默认 dry-run；commit 必须 `commit: true`。删除 = 先整树备份到 `backups/<名>-<时间戳>`
-  再删（两步），占用/权限问题会 block（`Candidate.blocked`），被拦截项不可勾选。
-- 保护路径通过 `protected_prefixes` 传入（GUI 传账本与配置文件路径）。
+- [`docs/ETW.md`](docs/ETW.md)：ETW 采集实现细节
+- [`docs/GUI-CORE.md`](docs/GUI-CORE.md)：GUI 与后台进程的协作方式
+- [`docs/SECURITY.md`](docs/SECURITY.md)：清理安全模型
+- [`docs/MINIFILTER.md`](docs/MINIFILTER.md)：未启用的内核驱动方案
+- [`架构功能细节(AI看).md`](架构功能细节(AI看).md)：源码地图与改动指引（面向开发者）
 
-### GUI (gui/src/main.rs)
-- eframe 0.28（glow, default-features=false）；**默认字体不含 CJK**，启动时必须
-  `install_cjk_fonts` 加载 msyh/simhei/simsun（已实现，勿删）。
-- release 有 `#![windows_subsystem = "windows"]`（debug 保留控制台）。
-- 三个页签：账本总览（按 EXE 聚合→勾选删除）/ 监视目录 / 设置。
+---
 
-## 验证状态基线（改动前先知道哪些是真的）
+## 许可
 
-| 功能 | 级别 |
-| --- | --- |
-| ETW 采集+短命进程归属（cmd /c mkdir 即退） | ✅ 真机 |
-| 批量压测 20 短命进程/210ms，全部记账 ~1s，CPU≈0，私有内存 ~6MB | ✅ 真机 |
-| 备份+两步删除 | ✅ 真机 |
-| GUI 聚合视图/字体 | ✅ 真机（人工目视） |
-| ETW 丢失报告 | 逻辑+计数可见，未注入真实丢失场景 |
-| Minifilter | 仅源码，未编译未加载 |
-| 开机自启 | 仅方案（docs/GUI-CORE.md），未安装 |
-
-## 性能目标（常驻后台）
-
-appdir-core.exe 空闲私有内存个位数 MB、CPU 接近 0%；事件洪峰（批量建目录）全部记账
-秒级完成且 CPU 增量毫秒级。改动 capture 层后务必重跑类似压测
-（20 个 `cmd /c mkdir` + 轮询 `query all` 直到全部入库，对比 `Get-Process` CPU 增量）。
-
-## 文档
-
-- `docs/ETW.md` — ETW 实现细节
-- `docs/GUI-CORE.md` — 双 exe 路径约定与自启方案
-- `docs/SECURITY.md` — 删除防护
-- `docs/MINIFILTER.md` — 驱动路线
-
-## 明确不做
-
-- 服务调用链/RPC 归属、进程树追踪（超范围）
-- 递归监视（只有根目录的直接子目录）
+MIT
