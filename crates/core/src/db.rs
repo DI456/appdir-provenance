@@ -627,6 +627,19 @@ impl Db {
             .map_err(|e| Error::Sqlite(e.to_string()))
     }
 
+    /// 删除账本中的目录记录 (只动 SQLite, 不碰文件系统)。返回删除行数。
+    /// 用于清理“原目录已不存在、仅剩账本记录”的失效条目。
+    pub fn delete_dir_records(&self, ids: &[i64]) -> Result<usize> {
+        let db = self.lock();
+        let mut n = 0;
+        for id in ids {
+            n += db
+                .execute("DELETE FROM directories WHERE directory_id = ?1", params![id])
+                .map_err(|e| Error::Sqlite(e.to_string()))?;
+        }
+        Ok(n)
+    }
+
     pub fn ignored_counts(&self) -> Result<Vec<(String, i64)>> {
         let db = self.lock();
         let mut st = db
@@ -710,4 +723,64 @@ pub enum InsertOutcome {
     Recorded { directory_id: i64 },
     Reregistered { directory_id: i64 },
     AlreadyRegistered { directory_id: i64 },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::SourceKind;
+
+    fn seed(db: &Db) -> i64 {
+        db.add_root(r"C:\appdir-test", 1_000).unwrap();
+        let rec = DirCreateRecord {
+            directory_path: r"C:\appdir-test\created".to_string(),
+            monitor_root: r"C:\appdir-test".to_string(),
+            exe_path: r"C:\tools\setup.exe".to_string(),
+            exe_name: "setup.exe".to_string(),
+            creator_pid: 1234,
+            created_at_ms: 2_000,
+            observed_at_ms: 2_000,
+            capture_source: SourceKind::Sim,
+            attribution_confidence: "sim".to_string(),
+        };
+        match db.insert_or_reregister(&rec).unwrap() {
+            InsertOutcome::Recorded { directory_id } => directory_id,
+            other => panic!("unexpected insert outcome: {other:?}"),
+        }
+    }
+
+    /// 删除账本记录只动 SQLite: 目录行消失, 应用行保留 (exe 仍是已知程序)。
+    #[test]
+    fn delete_dir_records_removes_rows_only() {
+        let db = Db::in_memory().unwrap();
+        let id = seed(&db);
+        assert_eq!(db.all_dirs().unwrap().len(), 1);
+
+        assert_eq!(db.delete_dir_records(&[id]).unwrap(), 1);
+        assert!(db.all_dirs().unwrap().is_empty());
+        assert!(db.dir_by_path(r"C:\appdir-test\created").unwrap().is_none());
+        // 程序条目保留, 仍可被注册表采集当作已知 exe。
+        assert!(db.known_apps().unwrap().iter().any(|(_, a)| *a >= 1));
+    }
+
+    /// 删除不存在的 id 不报错, 返回 0。
+    #[test]
+    fn delete_dir_records_missing_id_is_noop() {
+        let db = Db::in_memory().unwrap();
+        assert_eq!(db.delete_dir_records(&[424242]).unwrap(), 0);
+    }
+
+    /// 目录被标记 Missing 后仍然保留在账本里, 直到显式删除记录。
+    #[test]
+    fn missing_rows_survive_until_record_deleted() {
+        let db = Db::in_memory().unwrap();
+        let id = seed(&db);
+        db.set_status(id, RecordStatus::Missing, 3_000).unwrap();
+        let rows = db.all_dirs().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record_status, RecordStatus::Missing);
+
+        db.delete_dir_records(&[id]).unwrap();
+        assert!(db.all_dirs().unwrap().is_empty());
+    }
 }

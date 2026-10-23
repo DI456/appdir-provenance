@@ -201,7 +201,7 @@ GUI 传入的受保护路径包括账本文件与配置文件；`backup_dir` 为
 - 入口 `main()`；`#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`（release 无控制台）。
 - `App::new`：加载配置/打开账本/加载 CJK 字体（`install_cjk_fonts`，**勿删**，默认字体不含中文）。
 - 五个页签：`Tab::{Ledger, Roots, Settings, RegLedger, Symlink}`。
-  - **账本总览**：顶部 `ui_view_switch` 切换 `ledger_view: LedgerView::{ByApp, ByRoot}`。`reload_apps` 一次性聚合出 `apps`（按 exe）与 `root_groups`（按 `monitor_root`，含 0 条记录的已配置根）。按程序：`open_app` → `ui_app_detail`；按目录：`open_root` → `ui_root_detail`（每行标注创建者 exe）；两者共用 `ui_dir_detail`。勾选后 `delete_checked` 走 `clean::verify/plan_for_exe/execute`，两步确认。
+  - **账本总览**：顶部 `ui_view_switch` 切换 `ledger_view: LedgerView::{ByApp, ByRoot}`。`reload_apps` 一次性聚合出 `apps`（按 exe）与 `root_groups`（按 `monitor_root`，含 0 条记录的已配置根），每组带 `dir_count` 与 `stale_count`（`record_status=missing` 的孤儿记录）。**总数只统计仍存在的目录，失效记录单独标注**。按程序：`open_app` → `ui_app_detail`；按目录：`open_root` → `ui_root_detail`（每行标注创建者 exe）；两者共用 `ui_dir_detail`。已失效的条目仍然展示，但只能勾选「只删除账本记录」（`Db::delete_dir_records`），不能删文件；`delete_checked` 同时处理“删目录”（`clean::execute`）与“删记录”，按钮文案随选择变化。
   - **监视目录**：`ui_roots` → `Db::add_root/remove_root/set_root_enabled`。
   - **设置**：`ui_settings`——账本路径（写 `appdir.json`，提示重启 core）、删除前备份开关、注册表监视三态（`off/cache/instant`，`AppConfig::set_reg_mode`）、开机自启。
   - **注册表账本**：见 §3.4。

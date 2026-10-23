@@ -51,6 +51,8 @@ enum LedgerView {
 struct DirRowUi {
     candidate: Candidate,
     checked: bool,
+    /// 原目录已不存在: 只能删除账本记录, 不能删除文件。
+    gone: bool,
 }
 
 #[derive(Clone)]
@@ -58,13 +60,17 @@ struct AppSummary {
     pub app_id: i64,
     pub exe_path: String,
     pub exe_name: String,
+    /// 仍存在的目录数。
     pub dir_count: usize,
+    /// 原目录已不在、只剩账本记录的条目数。
+    pub stale_count: usize,
 }
 
 #[derive(Clone)]
 struct RootSummary {
     pub root: String,
     pub dir_count: usize,
+    pub stale_count: usize,
     pub exe_count: usize,
 }
 
@@ -168,26 +174,40 @@ impl App {
         self.selected_root = None;
         self.results.clear();
         let Some(db) = &self.db else { return };
-        // 按 app / 按监视根 同时聚合目录记录; 已删除 (Missing) 的不算进计数,
-        // 与明细页一致: 总览数字 = 当前仍存在的目录数。
-        let mut by_app: BTreeMap<i64, Vec<appdir_core::DirRow>> = BTreeMap::new();
-        // key = 小写路径 (Windows 大小写不敏感), value = (显示路径, 目录数, 程序集合)。
-        let mut by_root: BTreeMap<String, (String, usize, std::collections::BTreeSet<i64>)> =
+        // 按 app / 按监视根 同时聚合目录记录。仍存在的记为 dir_count,
+        // 原目录已不在 (Missing) 的单独计为 stale_count: 它们只能删账本记录,
+        // 但程序仍会出现在列表里, 否则这些孤儿记录就无处可清。
+        let mut by_app: BTreeMap<i64, (usize, usize)> = BTreeMap::new();
+        // key = 小写路径 (Windows 大小写不敏感),
+        // value = (显示路径, 存在数, 失效数, 程序集合)。
+        let mut by_root: BTreeMap<String, (String, usize, usize, std::collections::BTreeSet<i64>)> =
             BTreeMap::new();
         match db.all_dirs() {
             Ok(dirs) => {
                 for d in dirs {
-                    if d.record_status == RecordStatus::Missing {
-                        continue;
-                    }
+                    let stale = d.record_status == RecordStatus::Missing;
                     let entry = by_root
                         .entry(d.monitor_root.to_ascii_lowercase())
                         .or_insert_with(|| {
-                            (d.monitor_root.clone(), 0, std::collections::BTreeSet::new())
+                            (
+                                d.monitor_root.clone(),
+                                0,
+                                0,
+                                std::collections::BTreeSet::new(),
+                            )
                         });
-                    entry.1 += 1;
-                    entry.2.insert(d.app_id);
-                    by_app.entry(d.app_id).or_default().push(d);
+                    if stale {
+                        entry.2 += 1;
+                    } else {
+                        entry.1 += 1;
+                    }
+                    entry.3.insert(d.app_id);
+                    let a = by_app.entry(d.app_id).or_insert((0, 0));
+                    if stale {
+                        a.1 += 1;
+                    } else {
+                        a.0 += 1;
+                    }
                 }
             }
             Err(e) => {
@@ -195,7 +215,7 @@ impl App {
                 return;
             }
         }
-        for (app_id, dirs) in by_app {
+        for (app_id, (live, stale)) in by_app {
             let app: Option<AppRow> = db.app_by_id(app_id).ok().flatten();
             let (exe_path, exe_name) = match &app {
                 Some(a) => (a.exe_path.clone(), a.exe_name.clone()),
@@ -205,25 +225,40 @@ impl App {
                 app_id,
                 exe_path,
                 exe_name,
-                dir_count: dirs.len(),
+                dir_count: live,
+                stale_count: stale,
             });
         }
-        self.apps.sort_by(|a, b| b.dir_count.cmp(&a.dir_count));
+        self.apps.sort_by(|a, b| {
+            b.dir_count
+                .cmp(&a.dir_count)
+                .then(b.stale_count.cmp(&a.stale_count))
+                .then_with(|| a.exe_name.to_ascii_lowercase().cmp(&b.exe_name.to_ascii_lowercase()))
+        });
         // 监视根分组: 以配置中的根为准 (0 条也显示), 再补上账本里残留的旧根。
         for r in &self.roots {
-            let (root, dir_count, apps) = by_root
+            let (root, dir_count, stale_count, apps) = by_root
                 .remove(&r.path.to_ascii_lowercase())
-                .unwrap_or_else(|| (r.path.clone(), 0, std::collections::BTreeSet::new()));
+                .unwrap_or_else(|| {
+                    (
+                        r.path.clone(),
+                        0,
+                        0,
+                        std::collections::BTreeSet::new(),
+                    )
+                });
             self.root_groups.push(RootSummary {
                 root,
                 dir_count,
+                stale_count,
                 exe_count: apps.len(),
             });
         }
-        for (_, (root, dir_count, apps)) in by_root {
+        for (_, (root, dir_count, stale_count, apps)) in by_root {
             self.root_groups.push(RootSummary {
                 root,
                 dir_count,
+                stale_count,
                 exe_count: apps.len(),
             });
         }
@@ -271,18 +306,35 @@ impl App {
             if let Ok(v) = clean::verify(db, &d.directory_path, Some(&exe_path), &protected) {
                 cand = v;
             }
-            // 已删除的目录不再展示（账本状态 Missing，或 verify 确认目录不存在）。
-            let gone = cand.record_status == RecordStatus::Missing
-                || matches!(cand.blocked, Some((clean::BlockReason::Missing, _)));
-            if gone {
-                continue;
+            // 失效条目 (只能删账本记录, 不能删文件) 的两种情形:
+            //   1. 磁盘上确实已经不存在了;
+            //   2. 账本已标记 missing (即使路径又出现也不可信, 交给下次重新注册)。
+            // 注意: verify 在“存在但打不开”(如权限不足) 时也报 Missing, 那不是失效。
+            let on_disk = path_exists(&cand.directory_path);
+            let gone = !on_disk || cand.record_status == RecordStatus::Missing;
+            if !on_disk && cand.record_status != RecordStatus::Missing && cand.directory_id >= 0 {
+                // 顺手把账本状态标成 Missing, 让总览的“已失效”计数对得上。
+                // 仅当父目录仍存在时才标记: 网络盘/移动硬盘暂时离线时整棵都不存在,
+                // 不应把记录永久标成失效。
+                let parent_ok = Path::new(&cand.directory_path)
+                    .parent()
+                    .map(|p| p.is_dir())
+                    .unwrap_or(false);
+                if parent_ok {
+                    let _ =
+                        db.set_status(cand.directory_id, RecordStatus::Missing, timefmt::now_ms());
+                    cand.record_status = RecordStatus::Missing;
+                }
             }
             let checked = if preserve_checks {
-                old_checks.get(&cand.directory_id).copied().unwrap_or_else(|| cand.deletable())
+                old_checks
+                    .get(&cand.directory_id)
+                    .copied()
+                    .unwrap_or_else(|| !gone && cand.deletable())
             } else {
-                cand.deletable()
+                !gone && cand.deletable()
             };
-            self.results.push(DirRowUi { candidate: cand, checked });
+            self.results.push(DirRowUi { candidate: cand, checked, gone });
         }
     }
 
@@ -341,18 +393,35 @@ impl App {
             if let Ok(v) = clean::verify(db, &d.directory_path, Some(&exe_path), &protected) {
                 cand = v;
             }
-            // 已删除的目录不再展示（账本状态 Missing，或 verify 确认目录不存在）。
-            let gone = cand.record_status == RecordStatus::Missing
-                || matches!(cand.blocked, Some((clean::BlockReason::Missing, _)));
-            if gone {
-                continue;
+            // 失效条目 (只能删账本记录, 不能删文件) 的两种情形:
+            //   1. 磁盘上确实已经不存在了;
+            //   2. 账本已标记 missing (即使路径又出现也不可信, 交给下次重新注册)。
+            // 注意: verify 在“存在但打不开”(如权限不足) 时也报 Missing, 那不是失效。
+            let on_disk = path_exists(&cand.directory_path);
+            let gone = !on_disk || cand.record_status == RecordStatus::Missing;
+            if !on_disk && cand.record_status != RecordStatus::Missing && cand.directory_id >= 0 {
+                // 顺手把账本状态标成 Missing, 让总览的“已失效”计数对得上。
+                // 仅当父目录仍存在时才标记: 网络盘/移动硬盘暂时离线时整棵都不存在,
+                // 不应把记录永久标成失效。
+                let parent_ok = Path::new(&cand.directory_path)
+                    .parent()
+                    .map(|p| p.is_dir())
+                    .unwrap_or(false);
+                if parent_ok {
+                    let _ =
+                        db.set_status(cand.directory_id, RecordStatus::Missing, timefmt::now_ms());
+                    cand.record_status = RecordStatus::Missing;
+                }
             }
             let checked = if preserve_checks {
-                old_checks.get(&cand.directory_id).copied().unwrap_or_else(|| cand.deletable())
+                old_checks
+                    .get(&cand.directory_id)
+                    .copied()
+                    .unwrap_or_else(|| !gone && cand.deletable())
             } else {
-                cand.deletable()
+                !gone && cand.deletable()
             };
-            self.results.push(DirRowUi { candidate: cand, checked });
+            self.results.push(DirRowUi { candidate: cand, checked, gone });
         }
     }
 
@@ -382,52 +451,82 @@ impl App {
 
     fn delete_checked(&mut self) {
         let Some(db) = &self.db else { return };
-        let selected: Vec<Candidate> = self
+        let live: Vec<Candidate> = self
             .results
             .iter()
-            .filter(|r| r.checked && r.candidate.deletable())
+            .filter(|r| r.checked && !r.gone && r.candidate.deletable())
             .map(|r| r.candidate.clone())
             .collect();
-        if selected.is_empty() {
-            self.status = "没有可删除的选中目录".into();
+        let gone: Vec<i64> = self
+            .results
+            .iter()
+            .filter(|r| r.checked && r.gone && r.candidate.directory_id >= 0)
+            .map(|r| r.candidate.directory_id)
+            .collect();
+        if live.is_empty() && gone.is_empty() {
+            self.status = "没有可处理的选中条目".into();
             return;
         }
-        let backup_dir = self.config_path.parent().unwrap_or(Path::new(".")).join("backups");
-        let backup_opt = self.config.backup.then_some(backup_dir.as_path());
-        let opts = CleanOptions {
-            backup_dir: backup_opt,
-            commit: true,
-            protected_prefixes: vec![
-                self.config.ledger_path.display().to_string(),
-                self.config_path.display().to_string(),
-            ],
-        };
-        match clean::execute(db, selected, &opts, timefmt::now_ms()) {
-            Ok(report) => {
-                self.status = format!(
-                    "删除完成: 删除 {}  跳过 {}{}",
-                    report.deletable_count(),
+        let mut parts: Vec<String> = Vec::new();
+        if !gone.is_empty() {
+            match db.delete_dir_records(&gone) {
+                Ok(n) => parts.push(format!("删除账本记录 {n} 条 (原目录已不在)")),
+                Err(e) => parts.push(format!("删除账本记录失败: {e}")),
+            }
+        }
+        if !live.is_empty() {
+            let backup_dir = self.config_path.parent().unwrap_or(Path::new(".")).join("backups");
+            let backup_opt = self.config.backup.then_some(backup_dir.as_path());
+            let opts = CleanOptions {
+                backup_dir: backup_opt,
+                commit: true,
+                protected_prefixes: vec![
+                    self.config.ledger_path.display().to_string(),
+                    self.config_path.display().to_string(),
+                ],
+            };
+            match clean::execute(db, live, &opts, timefmt::now_ms()) {
+                Ok(report) => parts.push(format!(
+                    "删除目录 {}  跳过 {}{}",
+                    report.deleted,
                     report.blocked_count(),
                     if self.config.backup {
                         format!("  备份于 {}", backup_dir.display())
                     } else {
                         "  (备份已关闭)".to_string()
                     }
-                );
+                )),
+                Err(e) => parts.push(format!("删除失败: {e}")),
             }
-            Err(e) => self.status = format!("删除失败: {e}"),
         }
+        self.status = parts.join("; ");
         // 先刷新总览聚合（会重建 apps / root_groups 列表），再重新打开当前明细：
-        // 已删除的目录（账本状态 Missing）不再显示在明细里。
+        // 已处理的条目（目录已删 / 记录已删）不再显示在明细里。
         let current_app = self.selected;
         let current_root = self.selected_root.clone();
         self.reload_apps();
         if let Some(id) = current_app {
             self.open_app(id, false);
+            // 该程序的记录已全部处理完: 明细已空, 直接回到总览。
+            if self.results.is_empty() {
+                self.back_to_list();
+                self.status.push_str(" (该程序已无剩余记录)");
+            }
         } else if let Some(root) = current_root {
             self.open_root(&root, false);
+            if self.results.is_empty() {
+                self.back_to_list();
+                self.status.push_str(" (该监视目录已无剩余记录)");
+            }
         }
     }
+}
+
+/// 路径在磁盘上是否还存在 (不看权限/可打开性, 只看目录项)。
+/// verify 的 Missing 有两种来源: 真的不存在, 或存在但打不开;
+/// 后者不应把账本条目当成“失效”。
+fn path_exists(p: &str) -> bool {
+    Path::new(p).symlink_metadata().is_ok()
 }
 
 fn open_db(p: &std::path::Path) -> appdir_core::Result<Db> {
@@ -533,10 +632,16 @@ impl App {
 
     fn ui_app_list(&mut self, ui: &mut egui::Ui) {
         let total: usize = self.apps.iter().map(|a| a.dir_count).sum();
+        let stale_total: usize = self.apps.iter().map(|a| a.stale_count).sum();
         ui.heading(format!(
-            "账本总览: {} 个程序, 累计 {} 条目录记录",
+            "账本总览: {} 个程序, 累计 {} 条目录记录{}",
             self.apps.len(),
-            total
+            total,
+            if stale_total > 0 {
+                format!(" + {stale_total} 条已失效")
+            } else {
+                String::new()
+            }
         ));
         self.ui_view_switch(ui);
         ui.label("点击某个程序查看它创建的目录并可删除。");
@@ -548,7 +653,16 @@ impl App {
                         self.open_app(a.app_id, false);
                     }
                     ui.vertical(|ui| {
-                        ui.label(format!("{}  ({} 个目录)", a.exe_name, a.dir_count));
+                        ui.label(format!(
+                            "{}  ({} 个目录{})",
+                            a.exe_name,
+                            a.dir_count,
+                            if a.stale_count > 0 {
+                                format!(", {} 条已失效", a.stale_count)
+                            } else {
+                                String::new()
+                            }
+                        ));
                         ui.small(&a.exe_path);
                     });
                 });
@@ -572,27 +686,41 @@ impl App {
     /// 按监视根分类的总览列表。
     fn ui_root_list(&mut self, ui: &mut egui::Ui) {
         let total: usize = self.root_groups.iter().map(|g| g.dir_count).sum();
+        let stale_total: usize = self.root_groups.iter().map(|g| g.stale_count).sum();
         ui.heading(format!(
-            "账本总览: {} 个监视目录, 累计 {} 条目录记录",
+            "账本总览: {} 个监视目录, 累计 {} 条目录记录{}",
             self.root_groups.len(),
-            total
+            total,
+            if stale_total > 0 {
+                format!(" + {stale_total} 条已失效")
+            } else {
+                String::new()
+            }
         ));
         self.ui_view_switch(ui);
         ui.label("点击某个监视目录查看其下捕获到的目录（含创建它的 exe），可勾选删除。");
         ui.add_space(8.0);
         egui::ScrollArea::vertical().show(ui, |ui| {
             for g in self.root_groups.clone() {
+                let rows = g.dir_count + g.stale_count;
                 ui.horizontal(|ui| {
                     if ui
-                        .add_enabled(g.dir_count > 0, egui::Button::new("查看"))
+                        .add_enabled(rows > 0, egui::Button::new("查看"))
                         .clicked()
                     {
                         self.open_root(&g.root, false);
                     }
                     ui.vertical(|ui| {
                         ui.label(format!(
-                            "{}  ({} 个目录, {} 个程序)",
-                            g.root, g.dir_count, g.exe_count
+                            "{}  ({} 个目录{}, {} 个程序)",
+                            g.root,
+                            g.dir_count,
+                            if g.stale_count > 0 {
+                                format!(", {} 条已失效", g.stale_count)
+                            } else {
+                                String::new()
+                            },
+                            g.exe_count
                         ));
                     });
                 });
@@ -611,13 +739,31 @@ impl App {
             .find(|a| a.app_id == app_id)
             .map(|a| a.exe_path.clone())
             .unwrap_or_default();
-        let title = format!("该程序创建的目录 (共 {} 条)", self.results.len());
+        let title = format!(
+            "该程序创建的目录 (共 {} 条{})",
+            self.results.len(),
+            self.stale_suffix()
+        );
         self.ui_dir_detail(ui, title, &exe, false);
     }
 
     fn ui_root_detail(&mut self, ui: &mut egui::Ui, root: &str) {
-        let title = format!("该监视目录下的目录 (共 {} 条)", self.results.len());
+        let title = format!(
+            "该监视目录下的目录 (共 {} 条{})",
+            self.results.len(),
+            self.stale_suffix()
+        );
         self.ui_dir_detail(ui, title, root, true);
+    }
+
+    /// 明细标题里的“其中 N 条原目录已不在”尾巴。
+    fn stale_suffix(&self) -> String {
+        let n = self.results.iter().filter(|r| r.gone).count();
+        if n > 0 {
+            format!(", 其中 {n} 条原目录已不在")
+        } else {
+            String::new()
+        }
     }
 
     /// 明细列表的共用界面; show_exe 为真时每行额外显示创建它的程序 (按目录视图)。
@@ -638,8 +784,10 @@ impl App {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if ui.button("全选").clicked() {
+                // 全选只默认勾上仍存在且可删的目录; 失效条目需手动勾选,
+                // 避免一次“全选 + 删除”就批量清掉账本记录。
                 for r in &mut self.results {
-                    r.checked = r.candidate.deletable();
+                    r.checked = !r.gone && r.candidate.deletable();
                 }
             }
             if ui.button("全不选").clicked() {
@@ -647,8 +795,27 @@ impl App {
                     r.checked = false;
                 }
             }
-            let n = self.results.iter().filter(|r| r.checked).count();
-            if ui.button(format!("删除选中 ({n})")).clicked() {
+            let live = self
+                .results
+                .iter()
+                .filter(|r| r.checked && !r.gone && r.candidate.deletable())
+                .count();
+            let gone: Vec<i64> = self
+                .results
+                .iter()
+                .filter(|r| r.checked && r.gone && r.candidate.directory_id >= 0)
+                .map(|r| r.candidate.directory_id)
+                .collect();
+            let mut label = match (live, gone.len()) {
+                (0, 0) => "删除选中 (0)".to_string(),
+                (0, g) => format!("原目录已不在，只删除账本中的记录 ({g})"),
+                (l, 0) => format!("删除选中 ({l})"),
+                (l, g) => format!("删除选中 (目录 {l} + 账本记录 {g})"),
+            };
+            if self.results.iter().any(|r| r.checked && r.gone && r.candidate.directory_id < 0) {
+                label.push_str("（另有失效记录行无法定位，已忽略）");
+            }
+            if ui.button(label).clicked() && (live > 0 || !gone.is_empty()) {
                 self.delete_checked();
             }
         });
@@ -656,7 +823,9 @@ impl App {
         egui::ScrollArea::vertical().show(ui, |ui| {
             for row in &mut self.results {
                 ui.horizontal(|ui| {
-                    if !row.candidate.deletable() {
+                    if row.gone {
+                        ui.checkbox(&mut row.checked, "");
+                    } else if !row.candidate.deletable() {
                         ui.label("⛔");
                     } else {
                         ui.checkbox(&mut row.checked, "");
@@ -666,12 +835,23 @@ impl App {
                         if show_exe {
                             ui.small(format!("创建者: {}", row.candidate.app_exe_path));
                         }
+                        let status_text = if row.gone {
+                            "原目录已不在（仅剩账本记录）".to_string()
+                        } else {
+                            format!(
+                                "状态: {}  {}",
+                                row.candidate.record_status.as_str(),
+                                row.candidate.block_text()
+                            )
+                        };
                         ui.small(format!(
-                            "创建于 {}  状态: {}  {}",
+                            "创建于 {}  {}",
                             timefmt::format_local(row.candidate.created_at_ms),
-                            row.candidate.record_status.as_str(),
-                            row.candidate.block_text()
+                            status_text
                         ));
+                        if row.gone {
+                            ui.small("勾选后只能删除账本中的记录，不会影响任何文件");
+                        }
                     });
                 });
             }
