@@ -46,6 +46,8 @@ enum LedgerView {
     ByApp,
     /// 按监视根聚合, 组内列出该根下捕获到的目录。
     ByRoot,
+    /// 不分组, 全部记录按创建时间倒序平铺。
+    ByTime,
 }
 
 struct DirRowUi {
@@ -73,6 +75,8 @@ struct AppSummary {
     pub dir_count: usize,
     /// 原目录已不在、只剩账本记录的条目数。
     pub stale_count: usize,
+    /// 最近一次创建目录的时间 (排序用, 新的在上)。
+    pub last_ms: i64,
 }
 
 #[derive(Clone)]
@@ -81,6 +85,8 @@ struct RootSummary {
     pub dir_count: usize,
     pub stale_count: usize,
     pub exe_count: usize,
+    /// 该根下最近一次创建目录的时间。
+    pub last_ms: i64,
 }
 
 struct App {
@@ -116,6 +122,23 @@ struct App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_cjk_fonts(&cc.egui_ctx);
+        // 全局字号放大 10%, 行距放宽: 明细里多行小字 (创建者/时间/状态) 太紧凑。
+        {
+            let mut style = (*cc.egui_ctx.style()).clone();
+            for ts in [
+                egui::TextStyle::Small,
+                egui::TextStyle::Body,
+                egui::TextStyle::Button,
+                egui::TextStyle::Heading,
+                egui::TextStyle::Monospace,
+            ] {
+                if let Some(f) = style.text_styles.get_mut(&ts) {
+                    f.size *= 1.10;
+                }
+            }
+            style.spacing.item_spacing.y = 6.0;
+            cc.egui_ctx.set_style(style);
+        }
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
         let config_path = config::config_path_for_exe(&exe);
         let (config, db, status) = match config::load_or_create(&config_path) {
@@ -186,11 +209,14 @@ impl App {
         // 按 app / 按监视根 同时聚合目录记录。仍存在的记为 dir_count,
         // 原目录已不在 (Missing) 的单独计为 stale_count: 它们只能删账本记录,
         // 但程序仍会出现在列表里, 否则这些孤儿记录就无处可清。
-        let mut by_app: BTreeMap<i64, (usize, usize)> = BTreeMap::new();
+        // last_ms = 该组内最近一次创建目录的时间, 一级列表按它倒序 (新的在上)。
+        let mut by_app: BTreeMap<i64, (usize, usize, i64)> = BTreeMap::new();
         // key = 小写路径 (Windows 大小写不敏感),
-        // value = (显示路径, 存在数, 失效数, 程序集合)。
-        let mut by_root: BTreeMap<String, (String, usize, usize, std::collections::BTreeSet<i64>)> =
-            BTreeMap::new();
+        // value = (显示路径, 存在数, 失效数, 程序集合, 最近创建时间)。
+        let mut by_root: BTreeMap<
+            String,
+            (String, usize, usize, std::collections::BTreeSet<i64>, i64),
+        > = BTreeMap::new();
         match db.all_dirs() {
             Ok(dirs) => {
                 for d in dirs {
@@ -203,6 +229,7 @@ impl App {
                                 0,
                                 0,
                                 std::collections::BTreeSet::new(),
+                                0,
                             )
                         });
                     if stale {
@@ -211,12 +238,14 @@ impl App {
                         entry.1 += 1;
                     }
                     entry.3.insert(d.app_id);
-                    let a = by_app.entry(d.app_id).or_insert((0, 0));
+                    entry.4 = entry.4.max(d.created_at_ms);
+                    let a = by_app.entry(d.app_id).or_insert((0, 0, 0));
                     if stale {
                         a.1 += 1;
                     } else {
                         a.0 += 1;
                     }
+                    a.2 = a.2.max(d.created_at_ms);
                 }
             }
             Err(e) => {
@@ -224,7 +253,7 @@ impl App {
                 return;
             }
         }
-        for (app_id, (live, stale)) in by_app {
+        for (app_id, (live, stale, last_ms)) in by_app {
             let app: Option<AppRow> = db.app_by_id(app_id).ok().flatten();
             let (exe_path, exe_name) = match &app {
                 Some(a) => (a.exe_path.clone(), a.exe_name.clone()),
@@ -236,17 +265,23 @@ impl App {
                 exe_name,
                 dir_count: live,
                 stale_count: stale,
+                last_ms,
             });
         }
         self.apps.sort_by(|a, b| {
-            b.dir_count
-                .cmp(&a.dir_count)
+            b.last_ms
+                .cmp(&a.last_ms)
+                .then(b.dir_count.cmp(&a.dir_count))
                 .then(b.stale_count.cmp(&a.stale_count))
-                .then_with(|| a.exe_name.to_ascii_lowercase().cmp(&b.exe_name.to_ascii_lowercase()))
+                .then_with(|| {
+                    a.exe_name
+                        .to_ascii_lowercase()
+                        .cmp(&b.exe_name.to_ascii_lowercase())
+                })
         });
         // 监视根分组: 以配置中的根为准 (0 条也显示), 再补上账本里残留的旧根。
         for r in &self.roots {
-            let (root, dir_count, stale_count, apps) = by_root
+            let (root, dir_count, stale_count, apps, last_ms) = by_root
                 .remove(&r.path.to_ascii_lowercase())
                 .unwrap_or_else(|| {
                     (
@@ -254,6 +289,7 @@ impl App {
                         0,
                         0,
                         std::collections::BTreeSet::new(),
+                        0,
                     )
                 });
             self.root_groups.push(RootSummary {
@@ -261,16 +297,20 @@ impl App {
                 dir_count,
                 stale_count,
                 exe_count: apps.len(),
+                last_ms,
             });
         }
-        for (_, (root, dir_count, stale_count, apps)) in by_root {
+        for (_, (root, dir_count, stale_count, apps, last_ms)) in by_root {
             self.root_groups.push(RootSummary {
                 root,
                 dir_count,
                 stale_count,
                 exe_count: apps.len(),
+                last_ms,
             });
         }
+        // 一级列表也按最近创建时间倒序 (新的在上)。
+        self.root_groups.sort_by(|a, b| b.last_ms.cmp(&a.last_ms));
     }
 
     fn open_app(&mut self, app_id: i64, preserve_checks: bool) {
@@ -297,6 +337,21 @@ impl App {
                 .into_iter()
                 .filter(|d| d.monitor_root.eq_ignore_ascii_case(root))
                 .collect(),
+            Err(e) => {
+                self.status = format!("读取账本失败: {e}");
+                return;
+            }
+        };
+        self.load_rows(dirs, preserve_checks);
+    }
+
+    /// 按时间视图: 不分组, 账本里的全部记录 (含已删除/符号链接) 平铺, 新的在上。
+    fn open_time_view(&mut self, preserve_checks: bool) {
+        self.selected = None;
+        self.selected_root = None;
+        let Some(db) = &self.db else { return };
+        let dirs = match db.all_dirs() {
+            Ok(ds) => ds,
             Err(e) => {
                 self.status = format!("读取账本失败: {e}");
                 return;
@@ -389,6 +444,9 @@ impl App {
                 ledger_only,
             });
         }
+        // 全部明细视图统一按创建时间倒序 (新的在上)。
+        self.results
+            .sort_by(|a, b| b.candidate.created_at_ms.cmp(&a.candidate.created_at_ms));
     }
 
     fn back_to_list(&mut self) {
@@ -484,6 +542,8 @@ impl App {
                 self.back_to_list();
                 self.status.push_str(" (该监视目录已无剩余记录)");
             }
+        } else if self.ledger_view == LedgerView::ByTime {
+            self.open_time_view(false);
         }
     }
 }
@@ -539,6 +599,8 @@ impl eframe::App for App {
                 self.open_app(id, true);
             } else if let Some(root) = self.selected_root.clone() {
                 self.open_root(&root, true);
+            } else if self.ledger_view == LedgerView::ByTime {
+                self.open_time_view(true);
             } else {
                 self.reload_apps();
             }
@@ -592,8 +654,19 @@ impl App {
             match self.ledger_view {
                 LedgerView::ByApp => self.ui_app_list(ui),
                 LedgerView::ByRoot => self.ui_root_list(ui),
+                LedgerView::ByTime => self.ui_time_list(ui),
             }
         }
+    }
+
+    /// 按时间视图: 全部记录平铺, 无一级菜单, 无返回按钮。
+    fn ui_time_list(&mut self, ui: &mut egui::Ui) {
+        let title = format!(
+            "全部目录记录 (按时间倒序, 共 {} 条{})",
+            self.results.len(),
+            self.stale_suffix()
+        );
+        self.ui_dir_detail(ui, title, "", true, false);
     }
 
     fn ui_app_list(&mut self, ui: &mut egui::Ui) {
@@ -610,7 +683,7 @@ impl App {
             }
         ));
         self.ui_view_switch(ui);
-        ui.label("点击某个程序查看它创建的目录并可删除。");
+        ui.label("按各程序最近一次捕获时间排列（新的在上）。点击某个程序查看它创建的目录并可删除。");
         ui.add_space(8.0);
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -632,6 +705,9 @@ impl App {
                             }
                         ));
                         ui.small(&a.exe_path);
+                        if a.last_ms > 0 {
+                            ui.small(format!("最近一次: {}", timefmt::format_local(a.last_ms)));
+                        }
                     });
                 });
                 ui.separator();
@@ -642,13 +718,25 @@ impl App {
         });
     }
 
-    /// 总览顶部的分类方式切换开关。
+    /// 总览顶部的分类方式切换开关。切换时立即重建对应列表。
     fn ui_view_switch(&mut self, ui: &mut egui::Ui) {
+        let mut want = self.ledger_view;
         ui.horizontal(|ui| {
             ui.label("分类方式:");
-            ui.selectable_value(&mut self.ledger_view, LedgerView::ByApp, "按程序 (exe)");
-            ui.selectable_value(&mut self.ledger_view, LedgerView::ByRoot, "按目录 (监视根)");
+            ui.selectable_value(&mut want, LedgerView::ByApp, "按程序 (exe)");
+            ui.selectable_value(&mut want, LedgerView::ByRoot, "按目录 (监视根)");
+            ui.selectable_value(&mut want, LedgerView::ByTime, "按时间");
         });
+        if want != self.ledger_view {
+            self.ledger_view = want;
+            self.selected = None;
+            self.selected_root = None;
+            self.results.clear();
+            // 时间视图不经过一级菜单, 切过来时直接建好列表; 另两种视图下一帧用聚合数据。
+            if want == LedgerView::ByTime {
+                self.open_time_view(false);
+            }
+        }
     }
 
     /// 按监视根分类的总览列表。
@@ -666,7 +754,9 @@ impl App {
             }
         ));
         self.ui_view_switch(ui);
-        ui.label("点击某个监视目录查看其下捕获到的目录（含创建它的 exe），可勾选删除。");
+        ui.label(
+            "按监视目录下最近一次捕获时间排列（新的在上）。点击某个监视目录查看其下捕获到的目录（含创建它的 exe），可勾选删除。",
+        );
         ui.add_space(8.0);
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -692,6 +782,12 @@ impl App {
                             },
                             g.exe_count
                         ));
+                        if g.last_ms > 0 {
+                            ui.small(format!(
+                                "最近一次: {}",
+                                timefmt::format_local(g.last_ms)
+                            ));
+                        }
                     });
                 });
                 ui.separator();
@@ -714,7 +810,7 @@ impl App {
             self.results.len(),
             self.stale_suffix()
         );
-        self.ui_dir_detail(ui, title, &exe, false);
+        self.ui_dir_detail(ui, title, &exe, false, true);
     }
 
     fn ui_root_detail(&mut self, ui: &mut egui::Ui, root: &str) {
@@ -723,7 +819,7 @@ impl App {
             self.results.len(),
             self.stale_suffix()
         );
-        self.ui_dir_detail(ui, title, root, true);
+        self.ui_dir_detail(ui, title, root, true, true);
     }
 
     /// 明细标题里的“其中 N 条原目录已不在”尾巴。
@@ -744,21 +840,27 @@ impl App {
         }
     }
 
-    /// 明细列表的共用界面; show_exe 为真时每行额外显示创建它的程序 (按目录视图)。
+    /// 明细列表的共用界面; show_exe 为真时每行额外显示创建它的程序,
+    /// show_back 为假时不显示「返回总览」按钮 (按时间视图没有上级)。
     fn ui_dir_detail(
         &mut self,
         ui: &mut egui::Ui,
         title: String,
         subtitle: &str,
         show_exe: bool,
+        show_back: bool,
     ) {
-        ui.horizontal(|ui| {
-            if ui.button("← 返回总览").clicked() {
-                self.back_to_list();
-            }
-        });
+        if show_back {
+            ui.horizontal(|ui| {
+                if ui.button("← 返回总览").clicked() {
+                    self.back_to_list();
+                }
+            });
+        }
         ui.heading(title);
-        ui.monospace(subtitle);
+        if !subtitle.is_empty() {
+            ui.monospace(subtitle);
+        }
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if ui.button("全选").clicked() {

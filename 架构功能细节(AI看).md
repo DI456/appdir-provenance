@@ -201,7 +201,7 @@ GUI 传入的受保护路径包括账本文件与配置文件；`backup_dir` 为
 - 入口 `main()`；`#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`（release 无控制台）。
 - `App::new`：加载配置/打开账本/加载 CJK 字体（`install_cjk_fonts`，**勿删**，默认字体不含中文）。
 - 五个页签：`Tab::{Ledger, Roots, Settings, RegLedger, Symlink}`。
-  - **账本总览**：顶部 `ui_view_switch` 切换 `ledger_view: LedgerView::{ByApp, ByRoot}`。`reload_apps` 一次性聚合出 `apps`（按 exe）与 `root_groups`（按 `monitor_root`，含 0 条记录的已配置根），每组带 `dir_count` 与 `stale_count`（`record_status=missing` 的孤儿记录）。**总数只统计仍存在的目录，失效记录单独标注**。按程序：`open_app`；按目录：`open_root`；两者都只做筛选，然后统一走 `load_rows`（verify + `gone`/`ledger_only` 判定 + 勾选状态），共用 `ui_dir_detail`。
+  - **账本总览**：顶部 `ui_view_switch` 切换 `ledger_view: LedgerView::{ByApp, ByRoot, ByTime}`。`reload_apps` 一次性聚合出 `apps`（按 exe）与 `root_groups`（按 `monitor_root`，含 0 条记录的已配置根），每组带 `dir_count`/`stale_count`/`last_ms`。**三种视图均按 created_at_ms 倒序（新的在上）**：一级列表按组内最近创建时间 `last_ms`，明细行在 `load_rows` 末尾统一 sort。按程序/按目录走 `open_app`/`open_root` 筛选后进 `load_rows`；按时间走 `open_time_view`（全量不筛选，无一级菜单、无返回按钮），复用 `ui_dir_detail`（`show_back=false`）。
   - **只删账本记录的条目**（`DirRowUi.ledger_only`）：`gone`（原目录已不存在）与 `BlockReason::ReparsePoint`（符号链接，工具不删链接本身）两类可勾选，但只执行 `Db::delete_dir_records`，不碰文件系统。`delete_checked` 同时处理“删目录”（`clean::execute`）与“删记录”，按钮文案随选择变化。
   - **监视目录**：`ui_roots` → `Db::add_root/remove_root/set_root_enabled`。
   - **设置**：`ui_settings`——账本路径（写 `appdir.json`，提示重启 core）、删除前备份开关、注册表监视三态（`off/cache/instant`，`AppConfig::set_reg_mode`）、开机自启。
