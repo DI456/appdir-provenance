@@ -659,8 +659,11 @@ impl App {
         }
     }
 
-    /// 按时间视图: 全部记录平铺, 无一级菜单, 无返回按钮。
+    /// 按时间视图: 全部记录平铺, 无一级菜单。
+    /// 注意: 视图切换开关必须先画, 否则切到「按时间」后顶部按钮就消失了。
     fn ui_time_list(&mut self, ui: &mut egui::Ui) {
+        self.ui_view_switch(ui);
+        ui.add_space(4.0);
         let title = format!(
             "全部目录记录 (按时间倒序, 共 {} 条{})",
             self.results.len(),
